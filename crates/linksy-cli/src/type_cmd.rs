@@ -14,9 +14,11 @@ pub struct Timing {
     pub watch: Duration,
     /// Waiting for the service to say it has passed everything on.
     pub drain: Duration,
+    /// A session the phone closes sooner than this after it began never really started.
+    pub instant_end: Duration,
 }
 
-pub const TIMING: Timing = Timing { write: Duration::from_secs(30), watch: linksy_ipc::typing::INSTANT_END, drain: Duration::from_secs(5) };
+pub const TIMING: Timing = Timing { write: Duration::from_secs(30), watch: linksy_ipc::typing::INSTANT_END, drain: Duration::from_secs(5), instant_end: linksy_ipc::typing::INSTANT_END };
 
 pub async fn run(c: &Client, to: &str, text: &[String]) -> Result<(), String> {
     use linksy_ipc::typing::{Problem, TargetError, check_target, paste_messages, read_bounded, start_problem};
@@ -78,6 +80,7 @@ async fn type_into(to: &str, socket: &std::path::Path, messages: &[ControlMsg], 
     use linksy_ipc::typing::{Closed, delivery_outcome};
     use tokio::io::AsyncWriteExt;
     let stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
+    let began = std::time::Instant::now();
     let (mut reader, mut writer) = stream.into_split();
     let frames: Vec<u8> = messages.iter().flat_map(linksy_ipc::linksy_core::protocol::control_frame).collect();
     let writing = tokio::select! {
@@ -85,7 +88,7 @@ async fn type_into(to: &str, socket: &std::path::Path, messages: &[ControlMsg], 
         r = tokio::time::timeout(timing.write, async { writer.write_all(&frames).await?; writer.flush().await }) => Writing::Wrote(r),
         _ = until_closed(&mut reader) => Writing::Closed,
     };
-    let not_taken = || delivery_outcome(Closed::WhileWriting).map_err(|_| not_enabled.to_string());
+    let not_taken = || delivery_outcome(Closed::WhileWriting, timing.instant_end).map_err(|_| not_enabled.to_string());
     match writing {
         Writing::Closed => return not_taken(),
         Writing::Wrote(Err(_)) => return Err(format!("{to} stopped taking typing: writing timed out.")),
@@ -95,7 +98,8 @@ async fn type_into(to: &str, socket: &std::path::Path, messages: &[ControlMsg], 
     }
     // Everything is written. The watch starts now.
     if tokio::time::timeout(timing.watch, until_closed(&mut reader)).await.is_ok() {
-        return delivery_outcome(Closed::AfterWriting).map_err(|_| not_enabled.to_string());
+        let closed = Closed::AfterWriting { after: began.elapsed() };
+        return delivery_outcome(closed, timing.instant_end).map_err(|_| not_enabled.to_string());
     }
     // Closing our end tells the service everything is sent; it closes its own once it has
     // passed it on
@@ -113,7 +117,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncReadExt;
 
-    const SHORT: Timing = Timing { write: Duration::from_millis(300), watch: Duration::from_millis(300), drain: Duration::from_millis(300) };
+    const SHORT: Timing = Timing { write: Duration::from_millis(300), watch: Duration::from_millis(300), drain: Duration::from_millis(300), instant_end: Duration::from_millis(100) };
 
     /// A socket the "service" listens on; `then` is what it does with the first connection and
     /// the bytes it received so far. Returns the run's result and what the service got.
@@ -175,20 +179,39 @@ mod tests {
         assert_eq!(result, Err("not enabled".to_string()));
     }
 
-    #[tokio::test]
-    async fn a_phone_that_takes_the_text_and_closes_is_not_a_failure() {
-        let (result, got) = typing_run("took", hi(), Timing { watch: Duration::from_secs(2), ..SHORT }, |mut s, sink| async move {
-            let mut buf = [0u8; 256];
-            while !contains(&sink.lock().unwrap(), b"hi") {
-                match s.read(&mut buf).await {
-                    Ok(n) if n > 0 => sink.lock().unwrap().extend_from_slice(&buf[..n]),
-                    _ => break,
-                }
+    /// The "service" reads until the text is in, then does `after_text`.
+    async fn takes_text_then(mut s: tokio::net::UnixStream, sink: Arc<Mutex<Vec<u8>>>) -> tokio::net::UnixStream {
+        let mut buf = [0u8; 256];
+        while !contains(&sink.lock().unwrap(), b"hi") {
+            match s.read(&mut buf).await {
+                Ok(n) if n > 0 => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                _ => break,
             }
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn a_phone_that_closes_at_once_after_a_short_text_did_not_take_it() {
+        // Linksy Keyboard off: the phone ends the session right after Allow. A short text is
+        // written before the close arrives, so on the wire it looks like a close after writing.
+        let timing = Timing { watch: Duration::from_secs(4), instant_end: Duration::from_secs(3), ..SHORT };
+        let (result, _) = typing_run("instant", hi(), timing, |s, sink| async move { drop(takes_text_then(s, sink).await) }).await;
+        let e = result.unwrap_err();
+        assert!(e.starts_with("not enabled"), "{e}");
+        assert!(e.contains("did arrive"), "the guidance says what to do if it was typed anyway: {e}");
+    }
+
+    #[tokio::test]
+    async fn a_phone_that_closes_well_after_the_text_is_not_a_failure() {
+        let timing = Timing { watch: Duration::from_secs(4), instant_end: Duration::from_millis(100), ..SHORT };
+        let (result, got) = typing_run("later", hi(), timing, |s, sink| async move {
+            let s = takes_text_then(s, sink).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
             drop(s);
         })
         .await;
-        assert_eq!(result, Ok(()), "closing after the text was written would make people retype it");
+        assert_eq!(result, Ok(()), "a session that stayed open past the window was working; closing later would make people retype");
         assert!(contains(&got, b"hi"));
     }
 

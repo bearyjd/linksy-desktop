@@ -347,17 +347,18 @@ pub enum Closed {
     NotYet,
     /// Before all the text was written and flushed: it never took it.
     WhileWriting,
-    /// After: the text was on its way, whatever the phone did with it.
-    AfterWriting,
+    /// After: `after` the session began (the text was on its way either way).
+    AfterWriting { after: Duration },
 }
 
 /// Whether a run is a failure given when the phone closed the session: closing before the
 /// text was written means it never took it (the same as in the window); closing after is not
 /// a failure, or people retype what was already typed.
-pub fn delivery_outcome(closed: Closed) -> Result<(), Problem> {
+pub fn delivery_outcome(closed: Closed, instant_end: Duration) -> Result<(), Problem> {
+    let _ = instant_end;
     match closed {
         Closed::WhileWriting => Err(Problem::EndedAtOnce),
-        Closed::NotYet | Closed::AfterWriting => Ok(()),
+        Closed::NotYet | Closed::AfterWriting { .. } => Ok(()),
     }
 }
 
@@ -621,12 +622,34 @@ mod tests {
     #[test]
     fn a_modifier_the_window_does_see_is_not_sent_twice() {
         let mut k = KeyTracker::default();
-        k.press(54, 0x61, Some('a'), CTRL); // Ctrl sent on its behalf
-        assert_eq!(sent(k.press(37, 0xffe3, None, CTRL)), vec![key(0xffe3, true)]);
+        k.press(54, 0x61, Some('a'), CTRL); // Control_L sent on its behalf
+        assert!(sent(k.press(37, 0xffe3, None, CTRL)).is_empty(), "the same keysym is handed over, not pressed again");
         assert_eq!(k.release(37), vec![key(0xffe3, false)]);
         let mut rest = k.release_all();
         rest.sort_by_key(|m| if let ControlMsg::Key { keysym, .. } = m { *keysym } else { 0 });
         assert_eq!(rest, vec![key(0x61, false)], "one Ctrl, and it is up");
+    }
+
+    #[test]
+    fn the_other_side_of_a_modifier_sent_on_a_keys_behalf_lets_go_of_that_one_first() {
+        // Left Ctrl was held before the window saw it; then Right Ctrl goes down
+        let mut k = KeyTracker::default();
+        k.press(54, 0x61, Some('a'), CTRL); // Control_L sent on its behalf
+        assert_eq!(sent(k.press(105, 0xffe4, None, CTRL)), vec![key(0xffe3, false), key(0xffe4, true)]);
+        assert_eq!(k.release(105), vec![key(0xffe4, false)]);
+        let mut rest = k.release_all();
+        rest.sort_by_key(|m| if let ControlMsg::Key { keysym, .. } = m { *keysym } else { 0 });
+        assert_eq!(rest, vec![key(0x61, false)], "Control_L is not left down");
+    }
+
+    #[test]
+    fn release_all_after_a_mix_of_sides_covers_everything() {
+        let mut k = KeyTracker::default();
+        k.press(54, 0x61, Some('a'), CTRL);
+        k.press(105, 0xffe4, None, CTRL);
+        let mut up = k.release_all();
+        up.sort_by_key(|m| if let ControlMsg::Key { keysym, .. } = m { *keysym } else { 0 });
+        assert_eq!(up, vec![key(0x61, false), key(0xffe4, false)], "Control_L went up when Right Ctrl took over");
     }
 
     #[test]
@@ -766,9 +789,14 @@ mod tests {
     }
 
     #[test]
-    fn a_phone_that_closes_before_the_text_is_written_is_not_a_success() {
-        assert_eq!(delivery_outcome(Closed::NotYet), Ok(()));
-        assert_eq!(delivery_outcome(Closed::WhileWriting), Err(Problem::EndedAtOnce));
-        assert_eq!(delivery_outcome(Closed::AfterWriting), Ok(()), "it took the text and then closed");
+    fn a_phone_that_closes_the_session_at_once_did_not_take_the_text() {
+        let window = Duration::from_secs(2);
+        assert_eq!(delivery_outcome(Closed::NotYet, window), Ok(()));
+        assert_eq!(delivery_outcome(Closed::WhileWriting, window), Err(Problem::EndedAtOnce));
+        // a short text is written before the close arrives, which looks the same on the wire
+        assert_eq!(delivery_outcome(Closed::AfterWriting { after: Duration::from_millis(50) }, window), Err(Problem::EndedAtOnce));
+        assert_eq!(delivery_outcome(Closed::AfterWriting { after: window - Duration::from_millis(1) }, window), Err(Problem::EndedAtOnce));
+        assert_eq!(delivery_outcome(Closed::AfterWriting { after: window }, window), Ok(()), "the same edge as the window");
+        assert_eq!(delivery_outcome(Closed::AfterWriting { after: Duration::from_secs(30) }, window), Ok(()));
     }
 }
