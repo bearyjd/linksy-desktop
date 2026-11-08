@@ -3,11 +3,10 @@
 //! wires GTK's keys, input method and clipboard to it.
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::rc::{Rc, Weak};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -16,63 +15,21 @@ use gtk::{gdk, glib};
 use linksy_i18n::t;
 use linksy_ipc::linksy_core::protocol::control_frame;
 use linksy_ipc::linksy_core::{ControlMsg, Fingerprint, SessionKind, Uuid};
+use linksy_ipc::shutdown::{Action, Event, Shutdown as Closing};
 use linksy_ipc::typing::{KeyAction, KeyTracker, Mods, Phase, Problem, Step, paste_messages, text_messages};
+use linksy_ipc::writer::{Job, Parting, spawn};
 
 use super::Window;
 
-/// How long one write may wait for the service before the session counts as lost.
+/// How long one write may take, altogether, before the session counts as lost.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long in all letting go of held keys may take.
+/// How long in all letting go of held keys may take, from when it is asked for.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a closing connection may take to send what is queued and let go of the keys
+/// before it is cut and the session ended anyway (the release deadline, and some room).
+const CLOSE_FALLBACK: Duration = Duration::from_secs(3);
 /// What may wait to be written (a paste is one job); a phone slower than this is lost.
 const QUEUE: usize = 64;
-
-/// Work for the thread that writes to the service, so the window never waits on a socket.
-enum Job {
-    /// Frames to send, each within [`WRITE_TIMEOUT`].
-    Write(Vec<Vec<u8>>),
-    /// Frames to send within [`RELEASE_DEADLINE`] altogether.
-    Release(Vec<Vec<u8>>),
-    /// Everything before it is sent: close the connection.
-    Close,
-}
-
-/// Writes jobs in order until `Close`, the window letting go of the queue, or the first
-/// failed write (the rest is dropped). Tells the window when a write failed.
-fn spawn_writer(mut stream: UnixStream, failed: async_channel::Sender<()>) -> SyncSender<Job> {
-    let (tx, rx) = sync_channel(QUEUE);
-    std::thread::spawn(move || {
-        if !write_jobs(&mut stream, &rx) {
-            let _ = failed.send_blocking(());
-        }
-        let _ = stream.shutdown(Shutdown::Both);
-    });
-    tx
-}
-
-fn write_jobs(stream: &mut UnixStream, jobs: &Receiver<Job>) -> bool {
-    while let Ok(job) = jobs.recv() {
-        match job {
-            Job::Write(frames) => {
-                if frames.iter().any(|f| stream.write_all(f).is_err()) {
-                    return false;
-                }
-            }
-            Job::Release(frames) => {
-                let deadline = Instant::now() + RELEASE_DEADLINE;
-                for frame in frames {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() || stream.set_write_timeout(Some(left)).is_err() || stream.write_all(&frame).is_err() {
-                        return false;
-                    }
-                }
-                let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-            }
-            Job::Close => return true,
-        }
-    }
-    true
-}
 
 impl Window {
     /// Open the typing window for a phone and ask it (it always asks its user).
@@ -105,7 +62,12 @@ pub(super) struct Typer {
     started: Rc<Cell<Option<Instant>>>,
     /// The connection, kept to shut it down at once when the writer can't be trusted to.
     stream: Rc<RefCell<Option<UnixStream>>>,
+    /// The writer's queue; letting go of it makes the writer finish what is in it and close.
     writer: Rc<RefCell<Option<SyncSender<Job>>>>,
+    /// What the writer sends last (the keys to let go of), set even when the queue is full.
+    parting: Rc<RefCell<Option<Parting>>>,
+    /// Where the ordered shutdown is: the session ends only after the writer has drained.
+    closing: Rc<Cell<Closing>>,
     session: Rc<Cell<Option<Uuid>>>,
     /// Keys the phone holds, so none stays down there.
     keys: Rc<RefCell<KeyTracker>>,
@@ -136,6 +98,8 @@ impl Typer {
             started: Rc::default(),
             stream: Rc::default(),
             writer: Rc::default(),
+            parting: Rc::default(),
+            closing: Rc::new(Cell::new(Closing::Open)),
             session: Rc::default(),
             keys: Rc::default(),
             notice: Rc::default(),
@@ -190,16 +154,23 @@ impl Typer {
     }
 
     fn connected(&self, stream: UnixStream) {
-        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
         // Writes happen on a thread of their own: a slow service never stops the window
         match stream.try_clone() {
             Ok(out) => {
-                let (tx, rx) = async_channel::bounded::<()>(1);
-                *self.writer.borrow_mut() = Some(spawn_writer(out, tx));
+                let (tx, rx) = async_channel::bounded::<bool>(1);
+                let (jobs, parting) = spawn(out, QUEUE, WRITE_TIMEOUT, move |ok| {
+                    let _ = tx.send_blocking(ok);
+                });
+                *self.writer.borrow_mut() = Some(jobs);
+                *self.parting.borrow_mut() = Some(parting);
                 let t = self.clone();
                 glib::spawn_future_local(async move {
-                    if rx.recv().await.is_ok() {
-                        t.write_failed();
+                    if let Ok(ok) = rx.recv().await {
+                        if !ok {
+                            t.write_failed();
+                        }
+                        // The writer is done, whichever way: the session can end now
+                        t.closing_event(Event::Drained);
                     }
                 });
             }
@@ -249,23 +220,46 @@ impl Typer {
         self.show(&next);
     }
 
-    /// The connection ends here. When it is still good, what was typed is sent first and keys
-    /// still down are let go, then the writer closes it; if that can't be queued, or it is
-    /// already gone, it is shut down now.
+    /// The connection ends here. When it is still good, the writer is let go of: it sends
+    /// what was typed, lets go of the keys still down and closes, and only then is the
+    /// session ended (the service stops relaying the moment it ends). If the writer can't be
+    /// trusted, or it takes too long, the connection is cut and the session ended anyway.
     fn close_session(&self, next: &Phase) {
-        let writer = self.writer.borrow_mut().take();
-        let stream = self.stream.borrow_mut().take();
         let good = !matches!(next, Phase::Stopped { by_phone: true } | Phase::Failed(_) | Phase::Disconnected);
-        let closed_by_writer = good
-            && writer.as_ref().is_some_and(|tx| {
-                let up = self.keys.borrow_mut().release_all();
-                let frames = up.iter().map(control_frame).collect();
-                tx.try_send(Job::Release(frames)).is_ok() && tx.try_send(Job::Close).is_ok()
-            });
-        if let Some(stream) = stream.filter(|_| !closed_by_writer) {
-            let _ = stream.shutdown(Shutdown::Both);
+        let writer_alive = good && self.writer.borrow().is_some();
+        self.closing_event(Event::Begin { writer_alive });
+    }
+
+    fn closing_event(&self, event: Event) {
+        let (state, actions) = self.closing.get().next(event);
+        self.closing.set(state);
+        for action in actions {
+            match action {
+                Action::QueueRelease => {
+                    let up = self.keys.borrow_mut().release_all();
+                    let frames = up.iter().map(control_frame).collect();
+                    if let Some(parting) = self.parting.borrow().as_ref() {
+                        parting.set(frames, Instant::now() + RELEASE_DEADLINE);
+                    }
+                }
+                // Dropping the queue's sender: the writer still sends everything in it
+                Action::CloseQueue => drop(self.writer.borrow_mut().take()),
+                Action::ArmTimeout => {
+                    let t = self.clone();
+                    glib::spawn_future_local(async move {
+                        glib::timeout_future(CLOSE_FALLBACK).await;
+                        t.closing_event(Event::TimedOut);
+                    });
+                }
+                Action::ShutSocket => {
+                    drop(self.writer.borrow_mut().take());
+                    if let Some(stream) = self.stream.borrow_mut().take() {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                }
+                Action::EndSession => self.release_session(),
+            }
         }
-        self.release_session();
     }
 
     fn release_session(&self) {
@@ -353,7 +347,7 @@ impl Typer {
                 KeyAction::Ignore => {}
             }
         } else {
-            out.extend(self.keys.borrow_mut().release(code));
+            out.extend(self.keys.borrow_mut().release_event(code, key.into_glib()));
         }
         self.send(out);
         if close {
@@ -400,7 +394,9 @@ impl Typer {
             return;
         }
         let frames = up.iter().map(control_frame).collect();
-        let queued = self.writer.borrow().as_ref().map(|tx| tx.try_send(Job::Release(frames)).is_ok());
+        // The deadline starts now, not when the writer gets to it
+        let deadline = Instant::now() + RELEASE_DEADLINE;
+        let queued = self.writer.borrow().as_ref().map(|tx| tx.try_send(Job::Release(frames, deadline)).is_ok());
         if queued == Some(false) {
             self.write_failed();
         }
