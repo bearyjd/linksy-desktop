@@ -2493,7 +2493,7 @@ mod keyboard {
         let mut incoming = phone.node.incoming_sessions().unwrap();
         let remote = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await.unwrap();
         let session = incoming.recv().await.unwrap();
-        (remote, session.keyboard_input(), pc, phone)
+        (remote, session.keyboard_input().expect("an incoming typing session"), pc, phone)
     }
 
     async fn next(k: &mut linksy_core::keyboard::KeyboardInput) -> Option<KeyInput> {
@@ -2615,8 +2615,7 @@ mod keyboard {
         phone.node.set_features(vec!["keyboard".into()]).await;
         phone.node.respond(request, true);
         let got = call.await.unwrap();
-        let err = got.expect_err("typing was turned off in between").to_string();
-        assert!(err.contains("unsupported"), "declined as unsupported: {err}");
+        assert!(matches!(got, Err(linksy_core::Error::Unsupported)), "declined as unsupported: {got:?}");
     }
 
     #[tokio::test]
@@ -2745,6 +2744,21 @@ mod keyboard {
         assert_eq!(next(&mut kb).await, Some(KeyInput::Text("héllo".into())));
         assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 0xff0d, pressed: true }));
         assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 0xff0d, pressed: false }));
+    }
+
+    #[tokio::test]
+    async fn only_an_incoming_typing_session_on_a_phone_gives_keyboard_input() {
+        // A computer's touchpad session is not typing.
+        let (phone, pc) = paired().await;
+        let mut incoming = pc.node.incoming_sessions().unwrap();
+        let _remote = phone.node.request_session(&pc.node.info().id, SessionKind::Input).await.unwrap();
+        assert!(incoming.recv().await.unwrap().keyboard_input().is_none());
+        // Nor is the side that asked.
+        let (pc, phone) = computer_and_phone(true).await;
+        let mut incoming = phone.node.incoming_sessions().unwrap();
+        let remote = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await.unwrap();
+        assert!(remote.keyboard_input().is_none(), "the asking side has nothing to take");
+        assert!(incoming.recv().await.is_some());
     }
 
     #[tokio::test]

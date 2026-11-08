@@ -6,11 +6,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::identity::{DeviceInfo, DeviceKind};
 use crate::node::Session;
-use crate::protocol::ControlMsg;
+use crate::protocol::{ControlMsg, SessionKind};
 
 /// The feature a phone announces while its user lets computers type on it. Off unless the
 /// app turns it on, so an `input` session to a phone is refused by default.
@@ -83,11 +83,16 @@ impl KeyboardInput {
 impl Session {
     /// Take this `input` session's typing. Pointer, button and scroll frames are ignored.
     /// Needs a running Tokio runtime; dropping the result ends the session.
-    pub fn keyboard_input(self) -> KeyboardInput {
+    ///
+    /// This is the only supported way to use a typing session, and it is also what ends one
+    /// when typing is turned off. `None` (the session ends) for any session that isn't an
+    /// incoming `input` session on a phone or tablet, such as a computer's touchpad.
+    pub fn keyboard_input(mut self) -> Option<KeyboardInput> {
+        let typing = self.typing.take().filter(|_| self.kind == SessionKind::Input)?;
         let (tx, rx) = mpsc::channel(KEYBOARD_QUEUE + MAX_HELD_KEYS);
         let (id, peer) = (self.id, self.peer.clone());
-        tokio::spawn(pump(self, tx));
-        KeyboardInput { id, peer, rx }
+        tokio::spawn(pump(self, typing, tx));
+        Some(KeyboardInput { id, peer, rx })
     }
 }
 
@@ -114,14 +119,17 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Option<ControlMsg>, 
 /// Never waits on the app: text and presses go only while the room kept for releases is
 /// free, and releases always find room (there are never more owed than that room), so the
 /// session ends as soon as the peer goes, read or not.
-async fn pump(mut session: Session, tx: mpsc::Sender<KeyInput>) {
+async fn pump(mut session: Session, typing: (watch::Receiver<u64>, u64), tx: mpsc::Sender<KeyInput>) {
     let mut held: HashSet<u32> = HashSet::new();
-    let mut typing = session.typing.clone();
+    let (mut typing, started) = typing;
     loop {
+        // Biased: the app going and the kill-switch win over a frame that is ready.
         let msg = tokio::select! {
+            biased;
             _ = tx.closed() => break,
-            // The phone stopped taking typing (`set_features` without `keyboard`).
-            Ok(_) = typing.wait_for(|on| !*on) => break,
+            // The phone stopped taking typing at any time since this began, even if it
+            // takes it again now (`set_features` without `keyboard`), or is gone.
+            _ = typing.wait_for(|generation| *generation != started) => break,
             frame = read_frame(&mut session.recv) => match frame {
                 Ok(msg) => msg,
                 Err(()) => break,
