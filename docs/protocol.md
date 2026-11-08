@@ -2111,7 +2111,11 @@ phone is the receiver and hands them to its app. No new session kind and no new 
   a timeout or a session that ends at once as "not supported".
 - **Turned off:** when the phone stops announcing `keyboard` (`Node::set_features`), its
   typing sessions end at once (keys still down are released, `SessionEnded` follows), and
-  one whose user says yes after that is declined `unsupported`.
+  one whose user says yes after that is declined `unsupported`. Core counts the turn-offs,
+  so a turned-off-and-on keyboard still ends the sessions started before it, and declines
+  a request that was asked before it. This runs while the app reads `KeyboardInput`
+  (`Session::keyboard_input`, the only supported consumer): a typing session the app never
+  takes, or stops reading, ends only when the app drops it, so the app must do that.
 - **Frames:** the usual control frames (u32 length + JSON). Only `text` and `key`
   (`keysym`, `pressed`) count; `pointer`, `pointer_by`, `button`, `scroll` and the rest are
   ignored. Keys are X11 keysyms. Control characters in `text` (Unicode `Cc`: C0, DEL, C1)
@@ -2135,7 +2139,8 @@ phone is the receiver and hands them to its app. No new session kind and no new 
 - **Consent:** typing on a phone always asks its user, also from a computer allowed for
   good (that covers the screen and the touchpad, not typing); from away it is refused unless
   that computer is allowed from away, and then asked too (§4.13).
-- **Core API:** `Session::keyboard_input(self) -> KeyboardInput`, then
+- **Core API:** `Session::keyboard_input(self) -> Option<KeyboardInput>` (`None`, and the
+  session ends, unless it is an incoming `input` session on a phone or tablet), then
   `KeyboardInput::next().await -> Option<KeyInput>` (`KeyInput::Text(String)` or
   `KeyInput::Key { keysym, pressed }`; its `Debug` shows a text's length only). Add
   `"keyboard"` to `Config.features` or `Node::set_features` when the app can type.

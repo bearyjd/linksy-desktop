@@ -9,7 +9,8 @@ Linksy for Linux. Each version's section becomes its release notes.
   takes an `input` session from a computer and passes the text and key presses to its
   app, within fixed limits (frame size, text length, queue, held keys). Without the
   feature the phone declines. It always asks the phone's user, ends as soon as typing is
-  turned off, and never waits on the app to read. Nothing uses it yet.
+  turned off (also when turned off and on again: a session started before the
+  turn-off ends), and never waits on the app to read. Nothing uses it yet.
 
 ## 0.13.1
 
