@@ -3,10 +3,13 @@
 //! it is sent first, then the parting frames (the keys to let go of), and only then does the
 //! connection close: nothing typed is lost to a window that is closing.
 
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::timed::write_all_by;
 
 /// Work for the writer.
 pub enum Job {
@@ -19,14 +22,17 @@ pub enum Job {
 /// The frames to send last, after everything queued, and the time they must be sent by.
 /// Set once, from any thread, even when the queue is full.
 #[derive(Clone, Default)]
-pub struct Parting(Arc<Mutex<Option<(Vec<Vec<u8>>, Instant)>>>);
+pub struct Parting(Arc<Mutex<Option<Last>>>);
+
+/// Frames and the time they must be sent by.
+type Last = (Vec<Vec<u8>>, Instant);
 
 impl Parting {
     pub fn set(&self, frames: Vec<Vec<u8>>, deadline: Instant) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((frames, deadline));
     }
 
-    fn take(&self) -> Option<(Vec<Vec<u8>>, Instant)> {
+    fn take(&self) -> Option<Last> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
@@ -34,10 +40,35 @@ impl Parting {
 /// Starts the writer on `stream`. `on_end(true)` is called once it has sent everything and
 /// closed after the sender was dropped; `on_end(false)` if a write failed or ran out of
 /// time (the rest is dropped and the connection is cut).
-pub fn spawn(_stream: UnixStream, queue: usize, _write_timeout: Duration, on_end: impl FnOnce(bool) + Send + 'static) -> (SyncSender<Job>, Parting) {
-    let (tx, _rx) = sync_channel(queue);
-    std::thread::spawn(move || on_end(true));
-    (tx, Parting::default())
+pub fn spawn(mut stream: UnixStream, queue: usize, write_timeout: Duration, on_end: impl FnOnce(bool) + Send + 'static) -> (SyncSender<Job>, Parting) {
+    let (tx, rx) = sync_channel(queue);
+    let parting = Parting::default();
+    let last = parting.clone();
+    std::thread::spawn(move || {
+        let ok = write_all_jobs(&mut stream, &rx, write_timeout, &last);
+        let _ = stream.shutdown(Shutdown::Both);
+        on_end(ok);
+    });
+    (tx, parting)
+}
+
+fn send_by(stream: &mut UnixStream, frames: &[Vec<u8>], deadline: impl Fn() -> Instant) -> bool {
+    frames.iter().all(|f| write_all_by(stream, f, deadline()).is_ok())
+}
+
+/// Every job, then (once the sender is gone, which `recv` only says after the queue is
+/// empty) the parting frames. False at the first failed write.
+fn write_all_jobs(stream: &mut UnixStream, jobs: &Receiver<Job>, write_timeout: Duration, parting: &Parting) -> bool {
+    while let Ok(job) = jobs.recv() {
+        let sent = match job {
+            Job::Write(frames) => send_by(stream, &frames, || Instant::now() + write_timeout),
+            Job::Release(frames, deadline) => send_by(stream, &frames, || deadline),
+        };
+        if !sent {
+            return false;
+        }
+    }
+    parting.take().is_none_or(|(frames, deadline)| send_by(stream, &frames, || deadline))
 }
 
 #[cfg(test)]
