@@ -2500,6 +2500,13 @@ impl Node {
             let _ = send.finish();
             return;
         }
+        // A phone takes typing only while its app says so (feature `keyboard`); computers
+        // always take `input`, their touchpad.
+        if kind == SessionKind::Input && matches!(self.info().kind, DeviceKind::Phone | DeviceKind::Tablet) && !self.info().features.iter().any(|f| f == crate::keyboard::KEYBOARD_FEATURE) {
+            let _ = write_msg(&mut send, &decline("unsupported", None)).await;
+            let _ = send.finish();
+            return;
+        }
         let busy = self.live(&from.id).map(|(_, a)| a.hold());
         // A terminal: whoever runs them judges the code first.
         let mut terminal_id = None;
