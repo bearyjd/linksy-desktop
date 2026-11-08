@@ -1016,6 +1016,15 @@ pub async fn read_msg<T: for<'de> Deserialize<'de>>(s: &mut quinn::RecvStream) -
 mod tests {
 
     #[test]
+    fn debug_of_typed_content_shows_lengths_only() {
+        let text = format!("{:?}", ControlMsg::Text { text: "hunter2-secret".into() });
+        let term = format!("{:?}", ControlMsg::TermInput { data: "sudo-password\n".into() });
+        assert!(!text.contains("hunter2") && !term.contains("password"), "{text} {term}");
+        assert!(text.contains("14") && term.contains("14"), "lengths are kept: {text} {term}");
+        assert!(format!("{:?}", ControlMsg::Key { keysym: 65, pressed: true, code: None }).contains("65"));
+    }
+
+    #[test]
     fn terminal_requests_round_trip() {
         let id = Uuid::nil();
         let open = TerminalOpen { code: "482913".into(), cols: 80, rows: 24, resume: None };

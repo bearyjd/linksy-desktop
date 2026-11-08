@@ -2587,6 +2587,51 @@ mod keyboard {
     }
 
     #[tokio::test]
+    async fn typing_turned_off_and_on_at_once_still_ends_the_typing_and_lets_go_of_keys() {
+        let (mut remote, mut kb, _pc, phone) = typing(true).await;
+        let mut rp = phone.node.subscribe();
+        send(&mut remote, &[key(65, true)]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: true }));
+        phone.node.set_features(vec![]).await;
+        phone.node.set_features(vec!["keyboard".into()]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: false }));
+        assert_eq!(next(&mut kb).await, None);
+        ended(&mut rp, kb.id).await;
+    }
+
+    #[tokio::test]
+    async fn typing_turned_off_and_on_while_asking_is_declined_as_unsupported() {
+        let (pc, phone) = computer_and_asking_phone().await;
+        let _incoming = phone.node.incoming_sessions().unwrap();
+        let mut rp = phone.node.subscribe();
+        let (node, to) = (pc.node.clone(), phone.node.info().id);
+        let call = tokio::spawn(async move { node.request_session(&to, SessionKind::Input).await });
+        let request = wait_for(&mut rp, |e| match e {
+            Event::SessionRequest { request, kind: SessionKind::Input, .. } => Some(*request),
+            _ => None,
+        })
+        .await;
+        phone.node.set_features(vec![]).await;
+        phone.node.set_features(vec!["keyboard".into()]).await;
+        phone.node.respond(request, true);
+        let got = call.await.unwrap();
+        let err = got.expect_err("typing was turned off in between").to_string();
+        assert!(err.contains("unsupported"), "declined as unsupported: {err}");
+    }
+
+    #[tokio::test]
+    async fn no_frame_is_delivered_after_typing_is_turned_off_even_when_one_is_ready() {
+        let (mut remote, mut kb, _pc, phone) = typing(true).await;
+        send(&mut remote, &[key(65, true)]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: true }));
+        phone.node.set_features(vec![]).await;
+        let later: Vec<_> = (0..20).map(|i| ControlMsg::Text { text: format!("late{i}") }).collect();
+        send(&mut remote, &later).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: false }));
+        assert_eq!(next(&mut kb).await, None, "nothing typed after the off");
+    }
+
+    #[tokio::test]
     async fn a_disconnect_ends_the_session_even_when_the_app_is_not_reading() {
         let (mut remote, mut kb, _pc, phone) = typing(true).await;
         let mut rp = phone.node.subscribe();
