@@ -2467,7 +2467,7 @@ mod keyboard {
     async fn a_phone_without_the_keyboard_declines_input_as_unsupported() {
         let (pc, phone) = computer_and_phone(false).await;
         let _incoming = phone.node.incoming_sessions().unwrap();
-        let err = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await.err().expect("must be declined");
+        let Err(err) = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await else { panic!("must be declined") };
         assert!(matches!(err, Error::Unsupported), "{err:?}");
     }
 
