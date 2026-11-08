@@ -873,7 +873,8 @@ before a send, §4.22; computers announce it too), `apps` (sends and installs ap
 `snap` (opens its camera when a computer asks, §4.23), `sound` (shares the sound it plays
 while a computer shows its screen, §4.8), `phone_controls` (a phone's volumes,
 ringer, Do Not Disturb and flashlight, §4.24), `computer_notifications` (a phone that shows
-the notifications of a computer, §4.25).
+the notifications of a computer, §4.25), `keyboard` (a phone whose user lets computers type
+on it, §4.26).
 Set `Config.features` in the core. To change them while running (`notifications` turned
 on or off), call `Node::set_features`: connected devices get a `features` message
 (at most 64 names of up to 64 bytes) and update at once, others see the new list at the
@@ -2091,6 +2092,58 @@ What comes up on a computer comes up on a phone that asked for it. Feature
   the switch isn't shown there.
 - **Core API:** `node.send_computer_notification(id, key, app, title, body, at_ms)`;
   `Event::ComputerNotification`.
+
+### 4.26 Typing on the phone (desktop, after 0.13.1; not tried on a phone)
+
+A computer types into the phone's focused field. It uses the existing `input` session
+(§4.11) in the other direction: the computer is the requester and sends the frames, the
+phone is the receiver and hands them to its app. No new session kind and no new message.
+
+- **Capability:** the phone announces the feature `keyboard` only while its user has turned
+  typing on (and the app can type, for example through its own input method). It is off by
+  default: a phone (or tablet) without it answers `session_decline` with
+  `reason: "unsupported"` before asking its user (core does this). Computers always accept
+  `input` (the touchpad).
+- **Older phones:** a phone whose core predates this has no such check and gives no
+  `unsupported`: its user is asked (or, allowed for good, it may even accept) and an app
+  that doesn't know typing lets the request time out or end at once. A requester offers
+  typing only to a phone that announces `keyboard`, and treats a decline without a reason,
+  a timeout or a session that ends at once as "not supported".
+- **Turned off:** when the phone stops announcing `keyboard` (`Node::set_features`), its
+  typing sessions end at once (keys still down are released, `SessionEnded` follows), and
+  one whose user says yes after that is declined `unsupported`. Core counts the turn-offs,
+  so a turned-off-and-on keyboard still ends the sessions started before it, and declines
+  a request that was asked before it. This runs while the app reads `KeyboardInput`
+  (`Session::keyboard_input`, the only supported consumer): a typing session the app never
+  takes, or stops reading, ends only when the app drops it, so the app must do that.
+- **Frames:** the usual control frames (u32 length + JSON). Only `text` and `key`
+  (`keysym`, `pressed`) count; `pointer`, `pointer_by`, `button`, `scroll` and the rest are
+  ignored. Keys are X11 keysyms. Control characters in `text` (Unicode `Cc`: C0, DEL, C1)
+  are taken out, except tab and newline; Enter, Backspace and such are `key` frames.
+- **Keys the app must refuse:** core passes on any keysym. The app types only the keys a
+  keyboard field needs and refuses the rest (Super, power, media and launcher keys, and
+  anything else that acts outside the focused field).
+- **Limits** (core, `linksy_core::keyboard`): a frame body over 6208 bytes (room for the
+  longest text with every byte JSON-escaped) ends the session, and so does a frame not
+  finished within 10 s of its first byte (a pause between frames ends nothing); a `text`
+  over 1024 bytes as received, or empty once cleaned, is dropped; the app's queue holds
+  256 texts and presses, and those that arrive while it is full are dropped (the oldest are
+  kept); at most 32 keys held at once, more presses are ignored. The queue keeps room for
+  32 releases on top, so a release is never dropped, and a release for a key that was not
+  pressed is ignored. Core never waits for the app to read: the session ends as soon as
+  the peer goes.
+- **Disconnect:** keys still down when the session ends are released (queued after
+  everything else) while the app holds its `KeyboardInput`. Once the app drops it, nothing
+  more is delivered: an app that stops reading must itself release every key it pressed
+  and didn't release yet, or one stays stuck.
+- **Consent:** typing on a phone always asks its user, also from a computer allowed for
+  good (that covers the screen and the touchpad, not typing); from away it is refused unless
+  that computer is allowed from away, and then asked too (§4.13).
+- **Core API:** `Session::keyboard_input(self) -> Option<KeyboardInput>` (`None`, and the
+  session ends, unless it is an incoming `input` session on a phone or tablet), then
+  `KeyboardInput::next().await -> Option<KeyInput>` (`KeyInput::Text(String)` or
+  `KeyInput::Key { keysym, pressed }`; its `Debug` shows a text's length only). Add
+  `"keyboard"` to `Config.features` or `Node::set_features` when the app can type.
 
 ## 5. Core API the app would call (`linksy_core::Node`)
 

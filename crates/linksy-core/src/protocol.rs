@@ -162,7 +162,7 @@ impl SessionKind {
 /// Input sent by the viewer of a `control` session, framed like every other message
 /// (u32 length + JSON). Positions are fractions of the shared screen (0.0–1.0), so they
 /// don't depend on either device's resolution. Keys are X11 keysyms.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMsg {
     Pointer { x: f64, y: f64 },
@@ -186,6 +186,23 @@ pub enum ControlMsg {
     TermResize { cols: u16, rows: u16 },
     /// End the shell, not just this view of it.
     TermClose,
+}
+
+/// What was typed is not shown (logs, panics): `Text` and `TermInput` print their length only.
+impl std::fmt::Debug for ControlMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pointer { x, y } => f.debug_struct("Pointer").field("x", x).field("y", y).finish(),
+            Self::Button { button, pressed } => f.debug_struct("Button").field("button", button).field("pressed", pressed).finish(),
+            Self::Scroll { dx, dy, discrete } => f.debug_struct("Scroll").field("dx", dx).field("dy", dy).field("discrete", discrete).finish(),
+            Self::Key { keysym, pressed, code } => f.debug_struct("Key").field("keysym", keysym).field("pressed", pressed).field("code", code).finish(),
+            Self::PointerBy { dx, dy } => f.debug_struct("PointerBy").field("dx", dx).field("dy", dy).finish(),
+            Self::Text { text } => f.debug_struct("Text").field("len", &text.len()).finish(),
+            Self::TermInput { data } => f.debug_struct("TermInput").field("len", &data.len()).finish(),
+            Self::TermResize { cols, rows } => f.debug_struct("TermResize").field("cols", cols).field("rows", rows).finish(),
+            Self::TermClose => f.write_str("TermClose"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1014,6 +1031,15 @@ pub async fn read_msg<T: for<'de> Deserialize<'de>>(s: &mut quinn::RecvStream) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn debug_of_typed_content_shows_lengths_only() {
+        let text = format!("{:?}", ControlMsg::Text { text: "hunter2-secret".into() });
+        let term = format!("{:?}", ControlMsg::TermInput { data: "sudo-password\n".into() });
+        assert!(!text.contains("hunter2") && !term.contains("password"), "{text} {term}");
+        assert!(text.contains("14") && term.contains("14"), "lengths are kept: {text} {term}");
+        assert!(format!("{:?}", ControlMsg::Key { keysym: 65, pressed: true, code: None }).contains("65"));
+    }
 
     #[test]
     fn terminal_requests_round_trip() {

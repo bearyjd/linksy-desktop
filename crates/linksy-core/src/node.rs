@@ -365,6 +365,10 @@ pub struct Session {
     pub recv: quinn::RecvStream,
     _busy: Option<Busy>,
     events: broadcast::Sender<Event>,
+    /// For an incoming `input` session on a phone or tablet: the kill-switch generation it
+    /// started under. It ends when the generation changes (typing was turned off, even if
+    /// turned on again). `None` for every other session.
+    pub(crate) typing: Option<(watch::Receiver<u64>, u64)>,
 }
 
 /// A device wants a terminal here (docs/protocol.md §4.15). Whoever runs terminals (the daemon)
@@ -598,6 +602,10 @@ struct Inner {
     dialing: Mutex<HashMap<Fingerprint, Arc<tokio::sync::Mutex<()>>>>,
     /// Offers being gathered into one prompt, per device.
     gathering: Mutex<HashMap<Fingerprint, Gathering>>,
+    /// Counts the times this device stopped taking typing (§4.26): a typing session ends
+    /// when it differs from the count the session started under, so a quick off-and-on
+    /// can't be missed.
+    typing: watch::Sender<u64>,
     /// Accepted incoming sessions, for whoever runs the media side (the daemon).
     sessions: Mutex<Option<mpsc::UnboundedReceiver<Session>>>,
     sessions_tx: mpsc::UnboundedSender<Session>,
@@ -677,6 +685,7 @@ impl Node {
         let (gallery_tx, gallery) = mpsc::unbounded_channel();
         let (preflight_tx, preflight) = mpsc::unbounded_channel();
         let (terminals_tx, terminals) = mpsc::unbounded_channel();
+        let typing = watch::channel(0u64).0;
         let node = Self {
             inner: Arc::new(Inner {
                 id: info.id,
@@ -694,6 +703,7 @@ impl Node {
                 discovery_key: Mutex::new(discovery_key),
                 dialing: Mutex::new(HashMap::new()),
                 gathering: Mutex::default(),
+                typing,
                 invite: Mutex::new(None),
                 import_dir: Mutex::default(),
                 batteries: Mutex::default(),
@@ -786,7 +796,12 @@ impl Node {
             if info.features == features {
                 return;
             }
+            let was_typing = crate::keyboard::takes_typing(&info);
             info.features = features.clone();
+            // Typing turned off ends the typing sessions running (§4.26).
+            if was_typing && !crate::keyboard::takes_typing(&info) {
+                self.inner.typing.send_modify(|generation| *generation += 1);
+            }
         }
         self.tell_connected(Message::Features { features });
     }
@@ -1473,7 +1488,7 @@ impl Node {
         };
         let sharing = kind.requester_shares();
         self.emit(Event::SessionStarted { session: id, peer: peer.clone(), kind, sharing });
-        Ok((Session { id, peer, kind, sharing, size, choose: false, send, recv, _busy: Some(busy), events: self.inner.events.clone() }, terminal))
+        Ok((Session { id, peer, kind, sharing, size, choose: false, send, recv, _busy: Some(busy), events: self.inner.events.clone(), typing: None }, terminal))
     }
 
     /// Sessions this device accepted. Can be taken once; the taker runs the media (capture
@@ -2500,6 +2515,15 @@ impl Node {
             let _ = send.finish();
             return;
         }
+        // A phone takes typing only while its app says so (feature `keyboard`); computers
+        // always take `input`, their touchpad. The generation is read first: a turn-off,
+        // even one undone before the checks below, changes it.
+        let typing_generation = *self.inner.typing.borrow();
+        if kind == SessionKind::Input && !crate::keyboard::takes_typing(&self.info()) {
+            let _ = write_msg(&mut send, &decline("unsupported", None)).await;
+            let _ = send.finish();
+            return;
+        }
         let busy = self.live(&from.id).map(|(_, a)| a.hold());
         // A terminal: whoever runs them judges the code first.
         let mut terminal_id = None;
@@ -2530,8 +2554,10 @@ impl Node {
             }
         }
         // Otherwise asks, unless the user allowed this device the screen for good; from away
-        // it always asks.
+        // it always asks, and so does typing on a phone (§4.26).
+        let typing_here = kind == SessionKind::Input && crate::keyboard::is_handheld(&self.info());
         if kind.may_always_allow()
+            && !typing_here
             && self.link(&from.id) != Some(Link::Away)
             && self.inner.trust.lock().unwrap().get(&from.id).is_some_and(|t| t.allow_screen)
         {
@@ -2542,7 +2568,12 @@ impl Node {
             self.emit(Event::SessionRequest { request: id, from: from.clone(), kind });
             self.await_answer(id, answer, OFFER_TIMEOUT).await
         };
-        let unsupported = self.inner.unsupported.lock().unwrap().remove(&id);
+        // Typing turned off while asking, even if turned on again: no.
+        let typing_off = accepted
+            && kind == SessionKind::Input
+            && (*self.inner.typing.borrow() != typing_generation || !crate::keyboard::takes_typing(&self.info()));
+        let accepted = accepted && !typing_off;
+        let unsupported = self.inner.unsupported.lock().unwrap().remove(&id) || typing_off;
         let reply = match (accepted, unsupported) {
             (true, _) => {
                 let size = self.inner.session_sizes.lock().unwrap().remove(&id);
@@ -2558,7 +2589,8 @@ impl Node {
         let sharing = !kind.requester_shares();
         self.emit(Event::SessionStarted { session: id, peer: from.clone(), kind, sharing });
         let choose = choose && matches!(kind, SessionKind::Screen | SessionKind::Control);
-        let session = Session { id, peer: from, kind, sharing, size: None, choose, send, recv, _busy: busy, events: self.inner.events.clone() };
+        let typing = typing_here.then(|| (self.inner.typing.subscribe(), typing_generation));
+        let session = Session { id, peer: from, kind, sharing, size: None, choose, send, recv, _busy: busy, events: self.inner.events.clone(), typing };
         // Nobody to run it (no daemon took the receiver): dropping ends it.
         let _ = self.inner.sessions_tx.send(session);
     }

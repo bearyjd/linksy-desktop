@@ -7,6 +7,7 @@ pub mod cable;
 pub mod deck_layout;
 mod discovery;
 pub mod invite;
+pub mod keyboard;
 pub mod error;
 pub mod fs;
 pub mod gallery;
