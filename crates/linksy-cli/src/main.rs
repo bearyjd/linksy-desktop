@@ -165,6 +165,38 @@ fn upgrade(yes: bool) -> ExitCode {
     }
 }
 
+/// Writes `messages` into a typing session's stream, then watches as long as the window
+/// does for the phone ending the session: one that does so at once never took the text.
+async fn type_into(to: &str, socket: &std::path::Path, messages: &[linksy_ipc::linksy_core::ControlMsg], not_enabled: &str) -> Result<(), String> {
+    use linksy_ipc::typing::{INSTANT_END, session_outcome};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    for m in messages {
+        if let Err(e) = stream.write_all(&linksy_ipc::linksy_core::protocol::control_frame(m)).await {
+            return Err(match session_outcome(Some(started.elapsed())) {
+                Err(_) => not_enabled.to_string(),
+                Ok(()) => format!("{to} stopped taking typing: {e}"),
+            });
+        }
+    }
+    let mut buf = [0u8; 64];
+    let ended = loop {
+        let Some(left) = INSTANT_END.checked_sub(started.elapsed()) else { break None };
+        match tokio::time::timeout(left, stream.read(&mut buf)).await {
+            Err(_) => break None,
+            Ok(Ok(n)) if n > 0 => {}
+            Ok(_) => break Some(started.elapsed()),
+        }
+    };
+    session_outcome(ended).map_err(|_| not_enabled.to_string())?;
+    // Closing our end tells the service everything is sent; it closes its own once it has
+    // passed it on (or we give up waiting)
+    stream.shutdown().await.map_err(|e| e.to_string())?;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async { while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {} }).await;
+    Ok(())
+}
+
 async fn run(c: &Client, cmd: &str, rest: &[String]) -> Result<(), String> {
     let err = |e: ClientError| e.to_string();
     match (cmd, rest) {
@@ -425,27 +457,22 @@ async fn run(c: &Client, cmd: &str, rest: &[String]) -> Result<(), String> {
             println!("Shared clipboard with {to}.");
         }
         ("type", [to, text @ ..]) => {
-            use linksy_ipc::typing::{Problem, paste_messages, phone_takes_typing, start_problem};
-            let text = if text.is_empty() {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| e.to_string())?;
-                buf
-            } else {
-                text.join(" ")
-            };
+            use linksy_ipc::typing::{Problem, TargetError, check_target, paste_messages, read_bounded, start_problem};
+            let text = if text.is_empty() { read_bounded(std::io::stdin())? } else { text.join(" ") };
             let (messages, cut) = paste_messages(&text);
             if messages.is_empty() {
                 return Err("Nothing to type.".into());
             }
             let not_enabled = format!("{to} didn't take it. On {to}, open Linksy and turn on Linksy Keyboard, then try again and tap Allow. Older versions of the Linksy app can't take typing.");
-            // Only phones that say they take typing are asked
+            // Exactly one device, found the way the service finds it, and only a phone that
+            // says it takes typing is asked
             let known = c.devices().await.map_err(err)?;
-            let named = |d: &&linksy_ipc::linksy_core::DeviceView| d.device.name.eq_ignore_ascii_case(to) || d.device.id.short().eq_ignore_ascii_case(to);
-            if known.iter().filter(named).any(|d| !phone_takes_typing(&d.device)) {
-                return Err(not_enabled);
-            }
+            let id = check_target(&known, to).map_err(|e| match e {
+                TargetError::Resolve(e) => e,
+                TargetError::NotTyping => not_enabled.clone(),
+            })?;
             println!("Asking {to}: tap Allow on it…");
-            let info = match c.start_session(to.clone(), linksy_ipc::linksy_core::SessionKind::Input).await {
+            let info = match c.start_session(id.to_string(), linksy_ipc::linksy_core::SessionKind::Input).await {
                 Ok(info) => info,
                 Err(e) => {
                     return Err(match start_problem(&e.to_string()) {
@@ -455,13 +482,13 @@ async fn run(c: &Client, cmd: &str, rest: &[String]) -> Result<(), String> {
                     });
                 }
             };
-            let socket = info.socket.ok_or("no stream to type into")?;
-            let mut stream = tokio::net::UnixStream::connect(&socket).await.map_err(|e| e.to_string())?;
-            for m in &messages {
-                tokio::io::AsyncWriteExt::write_all(&mut stream, &linksy_ipc::linksy_core::protocol::control_frame(m)).await.map_err(|e| format!("{to} stopped taking typing: {e}"))?;
-            }
-            // Closing the stream ends the session once everything is on its way
-            tokio::io::AsyncWriteExt::shutdown(&mut stream).await.map_err(|e| e.to_string())?;
+            // The session is ended on every way out from here
+            let result = match info.socket.as_deref() {
+                Some(socket) => type_into(to, socket, &messages, &not_enabled).await,
+                None => Err("no stream to type into".to_string()),
+            };
+            let _ = c.end_session(info.session).await;
+            result?;
             println!("Typed on {to}.{}", if cut { " That was a lot: only the start was sent." } else { "" });
         }
         ("invite", []) => {
@@ -814,5 +841,41 @@ mod tests {
         for bad in ["media", "media=loud", "media=140", "ringer=loud", "dnd=maybe", "flashlight=dim", "volume=3"] {
             assert!(controls_change(&words(bad)).is_err(), "{bad}");
         }
+    }
+
+    /// A socket the "service" listens on; `then` is what it does with the first connection.
+    async fn typing_run<F, Fut>(name: &str, then: F) -> Result<(), String>
+    where
+        F: FnOnce(tokio::net::UnixStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let path = std::env::temp_dir().join(format!("linksy-cli-test-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let service = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            then(stream).await;
+        });
+        let msgs = linksy_ipc::typing::text_messages("hi");
+        let result = super::type_into("Pixel", &path, &msgs, "not enabled").await;
+        service.abort();
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[tokio::test]
+    async fn a_phone_that_closes_at_once_is_reported_not_typed_on() {
+        let result = typing_run("closes", |stream| async move { drop(stream) }).await;
+        assert_eq!(result, Err("not enabled".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_phone_that_keeps_the_session_open_is_typed_on() {
+        let result = typing_run("keeps", |mut stream| async move {
+            let mut buf = [0u8; 64];
+            while matches!(tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await, Ok(n) if n > 0) {}
+        })
+        .await;
+        assert_eq!(result, Ok(()));
     }
 }
