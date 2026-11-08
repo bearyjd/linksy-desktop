@@ -8,7 +8,8 @@ Linksy for Linux. Each version's section becomes its release notes.
 - **Typing on the phone, core half:** a phone that announces the feature `keyboard`
   takes an `input` session from a computer and passes the text and key presses to its
   app, within fixed limits (frame size, text length, queue, held keys). Without the
-  feature the phone declines. Nothing uses it yet.
+  feature the phone declines. It always asks the phone's user, ends as soon as typing is
+  turned off, and never waits on the app to read. Nothing uses it yet.
 
 ## 0.13.1
 
