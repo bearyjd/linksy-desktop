@@ -51,12 +51,24 @@ pub enum Action {
     EndSession,
 }
 
+const CUT: [Action; 2] = [Action::ShutSocket, Action::EndSession];
+
 impl Shutdown {
     pub fn next(self, event: Event) -> (Shutdown, Vec<Action>) {
+        use Shutdown::{Done, Draining, Open};
         match (self, event) {
-            (Shutdown::Open, Event::Begin { writer_alive: true }) => (Shutdown::Draining { writer_done: false, progress: false, extended: 0 }, vec![Action::QueueRelease, Action::CloseQueue, Action::ArmTimeout]),
-            (Shutdown::Open, Event::Begin { writer_alive: false }) | (Shutdown::Draining { .. }, Event::TimedOut) => (Shutdown::Done, vec![Action::ShutSocket, Action::EndSession]),
-            (Shutdown::Draining { .. }, Event::Drained { .. }) => (Shutdown::Done, vec![Action::EndSession]),
+            (Open, Event::Begin { writer_alive: true }) => (Draining { writer_done: false, progress: false, extended: 0 }, vec![Action::QueueRelease, Action::CloseQueue, Action::ArmTimeout]),
+            (Open, Event::Begin { writer_alive: false }) => (Done, CUT.to_vec()),
+            (Draining { writer_done, extended, .. }, Event::Progress) => (Draining { writer_done, progress: true, extended }, Vec::new()),
+            // finishing is progress too: the service gets a full period to pass it on
+            (Draining { extended, .. }, Event::Drained { ok: true }) => (Draining { writer_done: true, progress: true, extended }, Vec::new()),
+            (Draining { .. }, Event::Drained { ok: false }) => (Done, CUT.to_vec()),
+            // everything is written and passed on
+            (Draining { writer_done: true, .. }, Event::ServiceClosed) => (Done, vec![Action::EndSession]),
+            // the service closed before our end did: the phone ended the session
+            (Draining { writer_done: false, .. }, Event::ServiceClosed) => (Done, CUT.to_vec()),
+            (Draining { writer_done, progress: true, extended }, Event::TimedOut) if extended < MAX_EXTENSIONS => (Draining { writer_done, progress: false, extended: extended + 1 }, vec![Action::ArmTimeout]),
+            (Draining { .. }, Event::TimedOut) => (Done, CUT.to_vec()),
             (state, _) => (state, Vec::new()),
         }
     }
@@ -86,7 +98,7 @@ mod tests {
     #[test]
     fn drained_but_the_service_not_closed_does_not_end_the_session() {
         let (s, acts) = begun().next(DONE_OK);
-        assert_eq!((s, acts), (draining(true, false, 0), Vec::new()));
+        assert_eq!((s, acts), (draining(true, true, 0), Vec::new()), "finishing is progress, and nothing else happens");
     }
 
     #[test]
@@ -108,8 +120,10 @@ mod tests {
     #[test]
     fn a_wait_without_progress_is_cut_off_at_the_tick() {
         assert_eq!(begun().next(Event::TimedOut), (Shutdown::Done, vec![ShutSocket, EndSession]));
+        // the service never closes: it gets one full period after the writer finished, no more
         let (waiting, _) = begun().next(DONE_OK);
-        assert_eq!(waiting.next(Event::TimedOut), (Shutdown::Done, vec![ShutSocket, EndSession]), "the service never closed");
+        let (waiting, _) = waiting.next(Event::TimedOut);
+        assert_eq!(waiting.next(Event::TimedOut), (Shutdown::Done, vec![ShutSocket, EndSession]));
     }
 
     #[test]

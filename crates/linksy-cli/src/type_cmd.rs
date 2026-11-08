@@ -99,7 +99,8 @@ async fn type_into(to: &str, socket: &std::path::Path, messages: &[ControlMsg], 
     // Everything is written. The watch starts now.
     if tokio::time::timeout(timing.watch, until_closed(&mut reader)).await.is_ok() {
         let closed = Closed::AfterWriting { after: began.elapsed() };
-        return delivery_outcome(closed, timing.instant_end).map_err(|_| not_enabled.to_string());
+        return delivery_outcome(closed, timing.instant_end)
+            .map_err(|_| format!("{not_enabled} If the text did arrive, it was typed, but the phone closed the session right after."));
     }
     // Closing our end tells the service everything is sent; it closes its own once it has
     // passed it on

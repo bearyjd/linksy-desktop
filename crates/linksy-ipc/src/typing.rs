@@ -243,7 +243,18 @@ impl KeyTracker {
                 }
                 match modifier_class(*keysym) {
                     // the key itself takes over from one sent on its behalf
-                    Some(class) => self.down.retain(|(c, k)| !(is_synthetic(*c) && modifier_class(*k) == Some(class))),
+                    Some(class) => {
+                        if let Some(i) = self.down.iter().position(|(c, k)| is_synthetic(*c) && modifier_class(*k) == Some(class)) {
+                            let sent = self.down.remove(i).1;
+                            if sent == *keysym {
+                                // the phone already holds exactly this key: no second press
+                                self.down.push((code, *keysym));
+                                continue;
+                            }
+                            // the other side of the keyboard: the one sent earlier goes up first
+                            out.push(key_up(sent));
+                        }
+                    }
                     None => out.extend(self.missing_modifiers(mods)),
                 }
                 self.down.push((code, *keysym));
@@ -284,7 +295,7 @@ impl KeyTracker {
         up
     }
 
-        /// A key came up and its keysym is `keysym`: like [`release`](Self::release), and a
+    /// A key came up and its keysym is `keysym`: like [`release`](Self::release), and a
     /// modifier sent on its behalf (it was held before the window saw it) goes up too.
     pub fn release_event(&mut self, code: u32, keysym: u32) -> Vec<ControlMsg> {
         let up = self.release(code);
@@ -351,13 +362,16 @@ pub enum Closed {
     AfterWriting { after: Duration },
 }
 
-/// Whether a run is a failure given when the phone closed the session: closing before the
-/// text was written means it never took it (the same as in the window); closing after is not
-/// a failure, or people retype what was already typed.
+/// Whether a run is a failure given when the phone closed the session. A close before the
+/// text was written, or sooner than `instant_end` after the session began (the same rule as
+/// in the window), means the phone never kept the session: short text is written before the
+/// close arrives, so the two look alike on the wire, and a phone with Linksy Keyboard off
+/// ends the session right after Allow. A session that stayed open past the window, or closed
+/// well after it, was working; calling that a failure would make people retype.
 pub fn delivery_outcome(closed: Closed, instant_end: Duration) -> Result<(), Problem> {
-    let _ = instant_end;
     match closed {
         Closed::WhileWriting => Err(Problem::EndedAtOnce),
+        Closed::AfterWriting { after } if after < instant_end => Err(Problem::EndedAtOnce),
         Closed::NotYet | Closed::AfterWriting { .. } => Ok(()),
     }
 }

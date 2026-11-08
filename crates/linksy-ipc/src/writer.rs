@@ -42,8 +42,11 @@ impl Parting {
 /// dropped; `on_end(false)` if a write failed or ran out of time (the rest is dropped and the
 /// connection is cut).
 pub fn spawn(stream: UnixStream, queue: usize, write_timeout: Duration, on_progress: impl Fn() + Send + 'static, on_end: impl FnOnce(bool) + Send + 'static) -> (SyncSender<Job>, Parting) {
-    let close = |stream: &mut UnixStream, _ok: bool| {
-        let _ = stream.shutdown(Shutdown::Both);
+    // A writer that finished only closes its own side: the service closes its own once it
+    // has passed everything on, and reading that tells the window it is safe to end the
+    // session. One that failed cuts everything.
+    let close = |stream: &mut UnixStream, ok: bool| {
+        let _ = stream.shutdown(if ok { Shutdown::Write } else { Shutdown::Both });
     };
     spawn_on(stream, close, queue, write_timeout, on_progress, on_end)
 }
