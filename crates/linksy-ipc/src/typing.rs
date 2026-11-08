@@ -94,9 +94,13 @@ pub fn map_key(keysym: u32, ch: Option<char>, mods: Mods, pressed: bool) -> KeyA
     const TAB: u32 = 0xff09;
     const ISO_LEFT_TAB: u32 = 0xfe20;
     const INSERT: u32 = 0xff63;
+    const F4: u32 = 0xffc1;
     let key = |keysym| KeyAction::Send(vec![ControlMsg::Key { keysym, pressed, code: None }]);
     if mods.sup {
         return KeyAction::Ignore;
+    }
+    if keysym == F4 && mods.alt {
+        return if pressed { KeyAction::Close } else { KeyAction::Ignore };
     }
     match keysym {
         SHIFT_L | SHIFT_R | CONTROL_L | CONTROL_R | ALT_L | ALT_R => return key(keysym),
@@ -179,55 +183,124 @@ impl Phase {
             (Phase::Asking | Phase::Typing, Step::StopPressed) => Phase::Stopped { by_phone: false },
             (Phase::Asking | Phase::Typing, Step::Lost { after }) if after < INSTANT_END => Phase::Failed(Problem::EndedAtOnce),
             (Phase::Typing, Step::Lost { .. }) => Phase::Stopped { by_phone: true },
+            (Phase::Typing, Step::WriteFailed { after }) if after < INSTANT_END => Phase::Failed(Problem::EndedAtOnce),
+            (Phase::Typing, Step::WriteFailed { .. }) => Phase::Disconnected,
             (phase, _) => phase,
         }
     }
 }
 
-/// What the tracker knows of a key held down: its physical code and what the phone was told.
+/// Which keys the phone has been told are down, by physical key code. A release is always
+/// the opposite of what that key's press sent, whatever is held by then, so no key stays
+/// down on the phone when Ctrl or Super went up first.
 #[derive(Clone, Debug, Default)]
 pub struct KeyTracker {
+    /// (physical key code, keysym sent as pressed)
     down: Vec<(u32, u32)>,
 }
 
+const SHIFTS: [u32; 2] = [0xffe1, 0xffe2];
+const CONTROLS: [u32; 2] = [0xffe3, 0xffe4];
+const ALTS: [u32; 2] = [0xffe9, 0xffea];
+
+fn key_up(keysym: u32) -> ControlMsg {
+    ControlMsg::Key { keysym, pressed: false, code: None }
+}
+
+fn is_modifier(keysym: u32) -> bool {
+    SHIFTS.iter().chain(&CONTROLS).chain(&ALTS).any(|k| *k == keysym)
+}
+
 impl KeyTracker {
-    pub fn press(&mut self, _code: u32, _keysym: u32, _ch: Option<char>, _mods: Mods) -> KeyAction {
-        KeyAction::Ignore
+    /// A key went down: what to send, remembering which keys the phone now holds.
+    pub fn press(&mut self, code: u32, keysym: u32, ch: Option<char>, mods: Mods) -> KeyAction {
+        let action = map_key(keysym, ch, mods, true);
+        if let KeyAction::Send(msgs) = &action {
+            for msg in msgs {
+                if let ControlMsg::Key { keysym, pressed: true, .. } = msg {
+                    self.down.retain(|(c, _)| *c != code);
+                    self.down.push((code, *keysym));
+                }
+            }
+        }
+        action
     }
-    pub fn release(&mut self, _code: u32) -> Vec<ControlMsg> {
-        Vec::new()
+
+    /// A key came up: let go of what its press sent, if anything, however the modifiers are now.
+    pub fn release(&mut self, code: u32) -> Vec<ControlMsg> {
+        match self.down.iter().position(|(c, _)| *c == code) {
+            Some(i) => vec![key_up(self.down.remove(i).1)],
+            None => Vec::new(),
+        }
     }
-    pub fn release_stale(&mut self, _code: u32, _mods: Mods) -> Vec<ControlMsg> {
-        Vec::new()
+
+    /// Another key's event shows which modifiers are really held (`mods`): let go of any the
+    /// phone holds that aren't. An input method can swallow a modifier's release (Ctrl+Shift+U),
+    /// so nothing else would. `code` is the key the event is for, whose own state lags.
+    pub fn release_stale(&mut self, code: u32, mods: Mods) -> Vec<ControlMsg> {
+        let stale = |k: u32| (SHIFTS.contains(&k) && !mods.shift) || (CONTROLS.contains(&k) && !mods.ctrl) || (ALTS.contains(&k) && !mods.alt);
+        let (gone, kept): (Vec<_>, Vec<_>) = self.down.iter().partition(|(c, k)| *c != code && stale(*k));
+        let up = gone.iter().map(|(_, k)| key_up(*k)).collect();
+        self.down = kept;
+        up
     }
+
+    /// Everything the phone holds, let go (focus left, the session ends).
     pub fn release_all(&mut self) -> Vec<ControlMsg> {
-        Vec::new()
+        self.down.drain(..).map(|(_, k)| key_up(k)).collect()
     }
-    pub fn around_paste(&mut self, text: Vec<ControlMsg>) -> Vec<ControlMsg> {
-        text
+
+    /// `text` as pasted: the phone sees no modifier held while it arrives, and gets the ones
+    /// still held back afterwards.
+    pub fn around_paste(&self, text: Vec<ControlMsg>) -> Vec<ControlMsg> {
+        let held: Vec<u32> = self.down.iter().map(|(_, k)| *k).filter(|k| is_modifier(*k)).collect();
+        let mut out: Vec<ControlMsg> = held.iter().map(|k| key_up(*k)).collect();
+        out.extend(text);
+        out.extend(held.iter().map(|k| ControlMsg::Key { keysym: *k, pressed: true, code: None }));
+        out
     }
 }
 
 /// Why `linksy type` can't use a target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetError {
+    /// No such device, or several (the service's words).
     Resolve(String),
+    /// It isn't a phone or tablet that announces `keyboard`.
     NotTyping,
 }
 
-/// The one device `target` names, if it takes typing.
-pub fn check_target(_devices: &[DeviceView], _target: &str) -> Result<Fingerprint, TargetError> {
-    Err(TargetError::NotTyping)
+/// The one device `target` names, if it takes typing. A fingerprint nobody has announced is
+/// left to the service, which can't reach it either.
+pub fn check_target(devices: &[DeviceView], target: &str) -> Result<Fingerprint, TargetError> {
+    let id = crate::resolve::resolve_device(devices, target).map_err(TargetError::Resolve)?;
+    match devices.iter().find(|d| d.device.id == id) {
+        Some(d) if !phone_takes_typing(&d.device) => Err(TargetError::NotTyping),
+        _ => Ok(id),
+    }
 }
 
-/// All of `reader` as text, at most [`MAX_PASTE`] bytes.
-pub fn read_bounded(_reader: impl Read) -> Result<String, String> {
-    Ok(String::new())
+/// All of `reader` as text, at most [`MAX_PASTE`] bytes: more is an error, not a cut, and
+/// never read in full.
+pub fn read_bounded(reader: impl Read) -> Result<String, String> {
+    let mut buf = Vec::new();
+    reader.take(MAX_PASTE as u64 + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > MAX_PASTE {
+        return Err(format!("That is over {} KiB. Type less at a time.", MAX_PASTE / 1024));
+    }
+    String::from_utf8(buf).map_err(|_| "The input isn't text.".to_string())
 }
 
-/// How a `linksy type` run went, given when the phone ended the session if it did.
-pub fn session_outcome(_ended_after: Option<Duration>) -> Result<(), Problem> {
-    Ok(())
+/// How a `linksy type` run went, given when the phone ended the session if it did (within the
+/// time it watched): ending at once means it never took it, the same as in the window.
+pub fn session_outcome(ended_after: Option<Duration>) -> Result<(), Problem> {
+    match ended_after {
+        Some(after) => match Phase::Typing.next(Step::Lost { after }) {
+            Phase::Failed(problem) => Err(problem),
+            _ => Ok(()),
+        },
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -397,7 +470,6 @@ mod tests {
     }
 
     const SUPER: Mods = Mods { sup: true, ..NONE };
-    const SHIFT: Mods = Mods { shift: true, ..NONE };
 
     fn sent(a: KeyAction) -> Vec<ControlMsg> {
         match a {

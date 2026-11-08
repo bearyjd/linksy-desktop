@@ -5,8 +5,17 @@ use linksy_core::{DeviceView, Fingerprint};
 
 /// The device `target` names: a full fingerprint (taken as is), else a short id or a name,
 /// ignoring case and the spaces around it. Exactly one must match.
-pub fn resolve_device(_devices: &[DeviceView], _target: &str) -> Result<Fingerprint, String> {
-    Err(String::new())
+pub fn resolve_device(devices: &[DeviceView], target: &str) -> Result<Fingerprint, String> {
+    if let Ok(fp) = target.parse::<Fingerprint>() {
+        return Ok(fp);
+    }
+    let t = target.trim();
+    let mut matches = devices.iter().filter(|d| d.device.id.short().eq_ignore_ascii_case(t) || d.device.name.eq_ignore_ascii_case(t));
+    match (matches.next(), matches.next()) {
+        (Some(one), None) => Ok(one.device.id),
+        (None, _) => Err(format!("No device called \"{t}\". Run `linksy devices` to see what's nearby.")),
+        _ => Err(format!("Several devices are called \"{t}\". Use the device id instead.")),
+    }
 }
 
 #[cfg(test)]
