@@ -2,10 +2,11 @@
 //! devices to offer it for, what a key press or a paste becomes on the wire, and what to tell
 //! the person as the session goes. The GTK window and `linksy type` only wire this up.
 
+use std::io::Read;
 use std::time::Duration;
 
 use linksy_core::keyboard::{KEYBOARD_FEATURE, MAX_KEYBOARD_TEXT};
-use linksy_core::{ControlMsg, DeviceInfo, DeviceKind};
+use linksy_core::{ControlMsg, DeviceInfo, DeviceKind, DeviceView, Fingerprint};
 
 /// The most a single paste sends (bytes); more is left out. Well under what a phone queues
 /// (256 frames of up to [`MAX_KEYBOARD_TEXT`]), so a paste is never dropped half way.
@@ -75,6 +76,8 @@ pub enum KeyAction {
     Send(Vec<ControlMsg>),
     /// Read the clipboard and send it as text.
     Paste,
+    /// Alt+F4: close the typing window instead of typing it on the phone.
+    Close,
     Ignore,
 }
 
@@ -153,6 +156,8 @@ pub enum Phase {
     /// Over, by the person or by the phone, after a real start.
     Stopped { by_phone: bool },
     Failed(Problem),
+    /// A write to the phone failed after a real start: the connection is gone.
+    Disconnected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +166,8 @@ pub enum Step {
     StartFailed(String),
     /// The connection closed or a write failed, `after` it started.
     Lost { after: Duration },
+    /// Sending to the phone failed, `after` it started.
+    WriteFailed { after: Duration },
     StopPressed,
 }
 
@@ -175,6 +182,52 @@ impl Phase {
             (phase, _) => phase,
         }
     }
+}
+
+/// What the tracker knows of a key held down: its physical code and what the phone was told.
+#[derive(Clone, Debug, Default)]
+pub struct KeyTracker {
+    down: Vec<(u32, u32)>,
+}
+
+impl KeyTracker {
+    pub fn press(&mut self, _code: u32, _keysym: u32, _ch: Option<char>, _mods: Mods) -> KeyAction {
+        KeyAction::Ignore
+    }
+    pub fn release(&mut self, _code: u32) -> Vec<ControlMsg> {
+        Vec::new()
+    }
+    pub fn release_stale(&mut self, _code: u32, _mods: Mods) -> Vec<ControlMsg> {
+        Vec::new()
+    }
+    pub fn release_all(&mut self) -> Vec<ControlMsg> {
+        Vec::new()
+    }
+    pub fn around_paste(&mut self, text: Vec<ControlMsg>) -> Vec<ControlMsg> {
+        text
+    }
+}
+
+/// Why `linksy type` can't use a target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetError {
+    Resolve(String),
+    NotTyping,
+}
+
+/// The one device `target` names, if it takes typing.
+pub fn check_target(_devices: &[DeviceView], _target: &str) -> Result<Fingerprint, TargetError> {
+    Err(TargetError::NotTyping)
+}
+
+/// All of `reader` as text, at most [`MAX_PASTE`] bytes.
+pub fn read_bounded(_reader: impl Read) -> Result<String, String> {
+    Ok(String::new())
+}
+
+/// How a `linksy type` run went, given when the phone ended the session if it did.
+pub fn session_outcome(_ended_after: Option<Duration>) -> Result<(), Problem> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -217,6 +270,8 @@ mod tests {
         let long = "é".repeat(MAX_KEYBOARD_TEXT); // two bytes each
         let msgs = text_messages(&long);
         assert_eq!(msgs.len(), 2);
+        let lens: Vec<usize> = msgs.iter().map(|m| if let ControlMsg::Text { text } = m { text.len() } else { 0 }).collect();
+        assert_eq!(lens, vec![MAX_KEYBOARD_TEXT, MAX_KEYBOARD_TEXT], "cut exactly at the limit, on a character boundary");
         let mut joined = String::new();
         for m in &msgs {
             let ControlMsg::Text { text } = m else { panic!("not text: {m:?}") };
@@ -339,5 +394,185 @@ mod tests {
         assert_eq!(over.clone().next(Step::Started), over);
         let failed = Phase::Failed(Problem::NoAnswer);
         assert_eq!(failed.clone().next(Step::StopPressed), failed);
+    }
+
+    const SUPER: Mods = Mods { sup: true, ..NONE };
+    const SHIFT: Mods = Mods { shift: true, ..NONE };
+
+    fn sent(a: KeyAction) -> Vec<ControlMsg> {
+        match a {
+            KeyAction::Send(m) => m,
+            other => panic!("not sent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_key_pressed_under_ctrl_is_let_go_even_if_ctrl_went_first() {
+        let mut k = KeyTracker::default();
+        assert_eq!(sent(k.press(37, 0xffe3, None, NONE)), vec![key(0xffe3, true)]);
+        assert_eq!(sent(k.press(54, 0x63, Some('c'), CTRL)), vec![key(0x63, true)]);
+        assert_eq!(k.release(37), vec![key(0xffe3, false)]);
+        assert_eq!(k.release(54), vec![key(0x63, false)], "c must come up although Ctrl is already up");
+        assert!(k.release_all().is_empty());
+    }
+
+    #[test]
+    fn the_release_uses_the_keysym_of_the_press_not_the_current_one() {
+        let mut k = KeyTracker::default();
+        assert_eq!(sent(k.press(38, 0x61, Some('a'), CTRL)), vec![key(0x61, true)]);
+        // the layout or Shift changed meanwhile; the release reports a different keysym
+        assert_eq!(k.release(38), vec![key(0x61, false)]);
+    }
+
+    #[test]
+    fn super_pressed_after_the_key_does_not_strand_it() {
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        k.press(54, 0x63, Some('c'), CTRL);
+        assert_eq!(k.release(54), vec![key(0x63, false)], "released while Super is held");
+        assert_eq!(k.release(37), vec![key(0xffe3, false)]);
+    }
+
+    #[test]
+    fn a_key_the_phone_never_saw_is_not_released() {
+        let mut k = KeyTracker::default();
+        assert_eq!(k.press(54, 0x63, Some('c'), SUPER), KeyAction::Ignore);
+        assert!(k.release(54).is_empty(), "Super+c was never sent");
+        assert!(k.release(99).is_empty(), "unknown key");
+        k.press(55, 0x61, Some('a'), NONE);
+        assert!(k.release(55).is_empty(), "text keys have no key down on the phone");
+    }
+
+    #[test]
+    fn a_repeated_press_is_one_release() {
+        let mut k = KeyTracker::default();
+        for _ in 0..3 {
+            assert_eq!(sent(k.press(113, 0xff51, None, NONE)), vec![key(0xff51, true)]);
+        }
+        assert_eq!(k.release(113), vec![key(0xff51, false)]);
+        assert!(k.release(113).is_empty());
+    }
+
+    #[test]
+    fn losing_focus_lets_everything_go() {
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        k.press(50, 0xffe1, None, CTRL);
+        k.press(54, 0x63, Some('c'), Mods { ctrl: true, shift: true, ..NONE });
+        let mut up = k.release_all();
+        up.sort_by_key(|m| if let ControlMsg::Key { keysym, .. } = m { *keysym } else { 0 });
+        assert_eq!(up, vec![key(0x63, false), key(0xffe1, false), key(0xffe3, false)]);
+        assert!(k.release_all().is_empty());
+        assert!(k.release(54).is_empty());
+    }
+
+    #[test]
+    fn a_modifier_the_window_never_saw_released_is_let_go_on_the_next_key() {
+        // Ctrl+Shift+U in an input method can eat the releases
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        k.press(50, 0xffe1, None, CTRL);
+        assert!(k.release_stale(60, Mods { ctrl: true, shift: true, ..NONE }).is_empty(), "both still held");
+        assert_eq!(k.release_stale(61, Mods { ctrl: true, ..NONE }), vec![key(0xffe1, false)], "Shift is up now");
+        assert_eq!(k.release_stale(61, NONE), vec![key(0xffe3, false)]);
+        assert!(k.release_all().is_empty());
+    }
+
+    #[test]
+    fn a_modifier_is_not_stale_on_its_own_event() {
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        assert!(k.release_stale(37, NONE).is_empty(), "the state before its own press/release doesn't count");
+    }
+
+    #[test]
+    fn pasted_text_goes_without_modifiers_and_they_come_back_if_still_held() {
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        k.press(55, 0x76, Some('v'), CTRL); // paste: nothing sent, nothing tracked
+        let out = k.around_paste(vec![text("hi")]);
+        assert_eq!(out, vec![key(0xffe3, false), text("hi"), key(0xffe3, true)]);
+        assert_eq!(k.release(37), vec![key(0xffe3, false)], "Ctrl is still tracked as down");
+        assert_eq!(k.around_paste(vec![text("x")]), vec![text("x")], "nothing held, nothing around");
+    }
+
+    #[test]
+    fn alt_f4_closes_the_window_and_is_not_typed() {
+        assert_eq!(map_key(0xffc1, None, Mods { alt: true, ..NONE }, true), KeyAction::Close);
+        assert_eq!(map_key(0xffc1, None, NONE, true), KeyAction::Send(vec![key(0xffc1, true)]), "F4 alone is a key");
+        let mut k = KeyTracker::default();
+        assert_eq!(k.press(70, 0xffc1, None, Mods { alt: true, ..NONE }), KeyAction::Close);
+        assert!(k.release(70).is_empty());
+    }
+
+    #[test]
+    fn a_write_failing_is_a_lost_connection_unless_it_was_at_once() {
+        assert_eq!(Phase::Typing.next(Step::WriteFailed { after: Duration::from_secs(30) }), Phase::Disconnected);
+        assert_eq!(Phase::Typing.next(Step::WriteFailed { after: Duration::from_millis(100) }), Phase::Failed(Problem::EndedAtOnce));
+        let over = Phase::Stopped { by_phone: true };
+        assert_eq!(over.clone().next(Step::WriteFailed { after: Duration::from_secs(30) }), over);
+        assert_eq!(Phase::Disconnected.next(Step::StopPressed), Phase::Disconnected);
+    }
+
+    #[test]
+    fn the_services_real_errors_become_the_right_problems() {
+        use linksy_core::Error;
+        assert_eq!(start_problem(&Error::Unsupported.to_string()), Problem::Unsupported);
+        assert_eq!(start_problem(&Error::Declined.to_string()), Problem::NotAllowed);
+        assert_eq!(start_problem(&Error::Timeout.to_string()), Problem::NoAnswer);
+        assert!(matches!(start_problem(&Error::Unreachable.to_string()), Problem::Other(_)));
+    }
+
+    fn view(n: u8, name: &str, kind: DeviceKind, features: &[&str]) -> DeviceView {
+        let mut d = info(kind, features);
+        d.id = Fingerprint([n; 32]);
+        d.name = name.into();
+        serde_json::from_value(serde_json::json!({ "device": d, "trusted": true, "connected": true, "nearby": true })).unwrap()
+    }
+
+    #[test]
+    fn the_target_is_resolved_the_way_the_service_does_before_the_check() {
+        let devices = [view(1, "Pixel", DeviceKind::Phone, &["keyboard"]), view(2, "Old", DeviceKind::Phone, &["files"]), view(3, "Desk", DeviceKind::Desktop, &["keyboard"])];
+        let pixel = Fingerprint([1; 32]);
+        assert_eq!(check_target(&devices, "Pixel"), Ok(pixel));
+        assert_eq!(check_target(&devices, " pixel "), Ok(pixel), "padded name");
+        assert_eq!(check_target(&devices, &pixel.to_string()), Ok(pixel), "full fingerprint");
+        assert_eq!(check_target(&devices, " old "), Err(TargetError::NotTyping), "padded name still checked");
+        assert_eq!(check_target(&devices, &Fingerprint([2; 32]).to_string()), Err(TargetError::NotTyping), "full fingerprint still checked");
+        assert_eq!(check_target(&devices, &Fingerprint([3; 32]).short()), Err(TargetError::NotTyping), "a computer");
+        assert!(matches!(check_target(&devices, "Nokia"), Err(TargetError::Resolve(e)) if e.starts_with("No device called")));
+        assert_eq!(check_target(&devices, &Fingerprint([9; 32]).to_string()), Ok(Fingerprint([9; 32])), "unknown fingerprint: the service decides");
+    }
+
+    #[test]
+    fn stdin_is_read_up_to_the_paste_limit_and_no_further() {
+        assert_eq!(read_bounded("héllo\n".as_bytes()), Ok("héllo\n".to_string()));
+        let exact = "a".repeat(MAX_PASTE);
+        assert_eq!(read_bounded(exact.as_bytes()).map(|s| s.len()), Ok(MAX_PASTE));
+        let over = "a".repeat(MAX_PASTE + 1);
+        assert!(read_bounded(over.as_bytes()).unwrap_err().contains("100 KiB"));
+        assert!(read_bounded(&[0xff, 0xfe][..]).is_err(), "not text");
+    }
+
+    #[test]
+    fn stdin_never_reads_much_past_the_limit() {
+        struct Endless(usize);
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                buf.fill(b'a');
+                Ok(buf.len())
+            }
+        }
+        let mut r = Endless(0);
+        assert!(read_bounded(&mut r).is_err());
+        assert!(r.0 <= MAX_PASTE + 64 * 1024, "read {}", r.0);
+    }
+
+    #[test]
+    fn a_phone_that_ends_the_session_at_once_is_not_a_success() {
+        assert_eq!(session_outcome(None), Ok(()));
+        assert_eq!(session_outcome(Some(Duration::from_millis(300))), Err(Problem::EndedAtOnce));
+        assert_eq!(session_outcome(Some(INSTANT_END)), Ok(()), "ended after the text was on its way");
     }
 }
