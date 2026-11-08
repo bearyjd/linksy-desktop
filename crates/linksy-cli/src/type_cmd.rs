@@ -56,37 +56,55 @@ pub async fn run(c: &Client, to: &str, text: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes `messages` into a typing session's stream, then watches as long as the window
-/// does for the phone ending the session: one that does so at once never took the text.
-async fn type_into(to: &str, socket: &std::path::Path, messages: &[ControlMsg], not_enabled: &str, timing: Timing) -> Result<(), String> {
-    use linksy_ipc::typing::{INSTANT_END, session_outcome};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let _ = timing;
-    let mut stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
-    let started = std::time::Instant::now();
-    for m in messages {
-        if let Err(e) = stream.write_all(&linksy_ipc::linksy_core::protocol::control_frame(m)).await {
-            return Err(match session_outcome(Some(started.elapsed())) {
-                Err(_) => not_enabled.to_string(),
-                Ok(()) => format!("{to} stopped taking typing: {e}"),
-            });
-        }
-    }
+/// Reads until the other end closes (`Ok`) or the read fails.
+async fn until_closed(reader: &mut tokio::net::unix::OwnedReadHalf) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 64];
-    let ended = loop {
-        let Some(left) = INSTANT_END.checked_sub(started.elapsed()) else { break None };
-        match tokio::time::timeout(left, stream.read(&mut buf)).await {
-            Err(_) => break None,
-            Ok(Ok(n)) if n > 0 => {}
-            Ok(_) => break Some(started.elapsed()),
-        }
-    };
-    session_outcome(ended).map_err(|_| not_enabled.to_string())?;
-    // Closing our end tells the service everything is sent; it closes its own once it has
-    // passed it on (or we give up waiting)
-    stream.shutdown().await.map_err(|e| e.to_string())?;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async { while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {} }).await;
+    while reader.read(&mut buf).await? > 0 {}
     Ok(())
+}
+
+/// What happened first while the text was being written.
+enum Writing {
+    Wrote(Result<std::io::Result<()>, tokio::time::error::Elapsed>),
+    Closed,
+}
+
+/// Writes `messages` into a typing session's stream, then watches for `timing.watch` for the
+/// phone ending the session. One that does so before the text is written never took it;
+/// one that does so after did, whatever it did with it. Then the service is given
+/// `timing.drain` to say it has passed everything on, and not saying so is an error.
+async fn type_into(to: &str, socket: &std::path::Path, messages: &[ControlMsg], not_enabled: &str, timing: Timing) -> Result<(), String> {
+    use linksy_ipc::typing::{Closed, delivery_outcome};
+    use tokio::io::AsyncWriteExt;
+    let stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| e.to_string())?;
+    let (mut reader, mut writer) = stream.into_split();
+    let frames: Vec<u8> = messages.iter().flat_map(linksy_ipc::linksy_core::protocol::control_frame).collect();
+    let writing = tokio::select! {
+        biased;
+        r = tokio::time::timeout(timing.write, async { writer.write_all(&frames).await?; writer.flush().await }) => Writing::Wrote(r),
+        _ = until_closed(&mut reader) => Writing::Closed,
+    };
+    let not_taken = || delivery_outcome(Closed::WhileWriting).map_err(|_| not_enabled.to_string());
+    match writing {
+        Writing::Closed => return not_taken(),
+        Writing::Wrote(Err(_)) => return Err(format!("{to} stopped taking typing: writing timed out.")),
+        Writing::Wrote(Ok(Err(e))) if matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset) => return not_taken(),
+        Writing::Wrote(Ok(Err(e))) => return Err(format!("{to} stopped taking typing: {e}")),
+        Writing::Wrote(Ok(Ok(()))) => {}
+    }
+    // Everything is written. The watch starts now.
+    if tokio::time::timeout(timing.watch, until_closed(&mut reader)).await.is_ok() {
+        return delivery_outcome(Closed::AfterWriting).map_err(|_| not_enabled.to_string());
+    }
+    // Closing our end tells the service everything is sent; it closes its own once it has
+    // passed it on
+    writer.shutdown().await.map_err(|e| e.to_string())?;
+    match tokio::time::timeout(timing.drain, until_closed(&mut reader)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("Couldn't confirm {to} got it: {e}")),
+        Err(_) => Err(format!("{to} may not have got all of it: the service was still passing it on after {:?}.", timing.drain)),
+    }
 }
 
 #[cfg(test)]
