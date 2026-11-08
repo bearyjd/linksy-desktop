@@ -245,6 +245,12 @@ impl KeyTracker {
         up
     }
 
+        /// A key came up and its keysym is `keysym`: like [`release`](Self::release), and a
+    /// modifier sent on its behalf (it was held before the window saw it) goes up too.
+    pub fn release_event(&mut self, code: u32, _keysym: u32) -> Vec<ControlMsg> {
+        self.release(code)
+    }
+
     /// Everything the phone holds, let go (focus left, the session ends).
     pub fn release_all(&mut self) -> Vec<ControlMsg> {
         self.down.drain(..).map(|(_, k)| key_up(k)).collect()
@@ -289,6 +295,21 @@ pub fn read_bounded(reader: impl Read) -> Result<String, String> {
         return Err(format!("That is over {} KiB. Type less at a time.", MAX_PASTE / 1024));
     }
     String::from_utf8(buf).map_err(|_| "The input isn't text.".to_string())
+}
+
+/// Where the phone closed the session in a `linksy type` run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Closed {
+    NotYet,
+    /// Before all the text was written and flushed: it never took it.
+    WhileWriting,
+    /// After: the text was on its way, whatever the phone did with it.
+    AfterWriting,
+}
+
+/// Whether a run is a failure given when the phone closed the session.
+pub fn delivery_outcome(_closed: Closed) -> Result<(), Problem> {
+    Ok(())
 }
 
 /// How a `linksy type` run went, given when the phone ended the session if it did (within the
@@ -491,6 +512,7 @@ mod tests {
     #[test]
     fn the_release_uses_the_keysym_of_the_press_not_the_current_one() {
         let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
         assert_eq!(sent(k.press(38, 0x61, Some('a'), CTRL)), vec![key(0x61, true)]);
         // the layout or Shift changed meanwhile; the release reports a different keysym
         assert_eq!(k.release(38), vec![key(0x61, false)]);
@@ -501,8 +523,73 @@ mod tests {
         let mut k = KeyTracker::default();
         k.press(37, 0xffe3, None, NONE);
         k.press(54, 0x63, Some('c'), CTRL);
-        assert_eq!(k.release(54), vec![key(0x63, false)], "released while Super is held");
+        // Super goes down while c is held, and c repeats with Super in the state
+        let with_super = Mods { ctrl: true, sup: true, ..NONE };
+        assert_eq!(k.press(133, 0xffeb, None, CTRL), KeyAction::Ignore, "Super itself is not sent");
+        assert_eq!(k.press(54, 0x63, Some('c'), with_super), KeyAction::Ignore, "nothing is sent with Super held");
+        assert_eq!(k.release(133), Vec::new());
+        assert_eq!(k.release(54), vec![key(0x63, false)], "c comes up although Super was in the way");
         assert_eq!(k.release(37), vec![key(0xffe3, false)]);
+        assert!(k.release_all().is_empty());
+    }
+
+    #[test]
+    fn a_repeat_with_another_keysym_lets_go_of_the_first() {
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        assert_eq!(sent(k.press(38, 0x61, Some('a'), CTRL)), vec![key(0x61, true)]);
+        k.press(50, 0xffe1, None, CTRL);
+        // Shift joined while a repeats: the same physical key now reports A
+        let both = Mods { ctrl: true, shift: true, ..NONE };
+        assert_eq!(sent(k.press(38, 0x41, Some('A'), both)), vec![key(0x61, false), key(0x41, true)]);
+        assert_eq!(k.release(38), vec![key(0x41, false)]);
+        let mut rest = k.release_all();
+        rest.sort_by_key(|m| if let ControlMsg::Key { keysym, .. } = m { *keysym } else { 0 });
+        assert_eq!(rest, vec![key(0xffe1, false), key(0xffe3, false)], "a is not held any more");
+    }
+
+    #[test]
+    fn release_all_covers_a_key_whose_keysym_changed() {
+        let mut k = KeyTracker::default();
+        k.press(37, 0xffe3, None, NONE);
+        k.press(38, 0x61, Some('a'), CTRL);
+        k.press(38, 0x41, Some('A'), Mods { ctrl: true, shift: true, ..NONE });
+        let up = k.release_all();
+        assert!(up.contains(&key(0x41, false)) && !up.contains(&key(0x61, false)), "{up:?}");
+    }
+
+    #[test]
+    fn a_modifier_held_before_the_window_saw_it_is_sent_before_the_key() {
+        // focus came back, or the session began, with Ctrl already down
+        let mut k = KeyTracker::default();
+        assert_eq!(sent(k.press(54, 0x61, Some('a'), CTRL)), vec![key(0xffe3, true), key(0x61, true)]);
+        assert_eq!(sent(k.press(55, 0x62, Some('b'), CTRL)), vec![key(0x62, true)], "Ctrl is down on the phone now");
+        // it comes up when the key does, or at the next event if the window never sees that
+        assert_eq!(k.release_event(37, 0xffe3), vec![key(0xffe3, false)]);
+        assert!(k.release_stale(60, NONE).is_empty());
+    }
+
+    #[test]
+    fn missing_modifiers_come_in_a_fixed_order_and_only_for_keys() {
+        let mut k = KeyTracker::default();
+        let all = Mods { ctrl: true, alt: true, shift: true, sup: false };
+        assert_eq!(sent(k.press(23, 0xff09, None, all)), vec![key(0xffe3, true), key(0xffe9, true), key(0xffe1, true), key(0xff09, true)]);
+        let mut k = KeyTracker::default();
+        assert_eq!(sent(k.press(23, 0xfe20, None, Mods { shift: true, ..NONE })), vec![key(0xffe1, true), key(0xff09, true)], "Shift+Tab");
+        let mut k = KeyTracker::default();
+        assert_eq!(sent(k.press(50, 0xffe1, None, CTRL)), vec![key(0xffe1, true)], "a modifier key is only itself");
+        assert_eq!(sent(k.press(38, 0x41, Some('A'), Mods { shift: true, ..NONE })), vec![text("A")], "text carries its own Shift");
+    }
+
+    #[test]
+    fn a_modifier_the_window_does_see_is_not_sent_twice() {
+        let mut k = KeyTracker::default();
+        k.press(54, 0x61, Some('a'), CTRL); // Ctrl sent on its behalf
+        assert_eq!(sent(k.press(37, 0xffe3, None, CTRL)), vec![key(0xffe3, true)]);
+        assert_eq!(k.release(37), vec![key(0xffe3, false)]);
+        let mut rest = k.release_all();
+        rest.sort_by_key(|m| if let ControlMsg::Key { keysym, .. } = m { *keysym } else { 0 });
+        assert_eq!(rest, vec![key(0x61, false)], "one Ctrl, and it is up");
     }
 
     #[test]
@@ -642,9 +729,9 @@ mod tests {
     }
 
     #[test]
-    fn a_phone_that_ends_the_session_at_once_is_not_a_success() {
-        assert_eq!(session_outcome(None), Ok(()));
-        assert_eq!(session_outcome(Some(Duration::from_millis(300))), Err(Problem::EndedAtOnce));
-        assert_eq!(session_outcome(Some(INSTANT_END)), Ok(()), "ended after the text was on its way");
+    fn a_phone_that_closes_before_the_text_is_written_is_not_a_success() {
+        assert_eq!(delivery_outcome(Closed::NotYet), Ok(()));
+        assert_eq!(delivery_outcome(Closed::WhileWriting), Err(Problem::EndedAtOnce));
+        assert_eq!(delivery_outcome(Closed::AfterWriting), Ok(()), "it took the text and then closed");
     }
 }

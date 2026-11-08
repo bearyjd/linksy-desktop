@@ -24,6 +24,8 @@ use tokio::sync::{broadcast, oneshot};
 pub use linksy_core;
 
 pub mod resolve;
+pub mod shutdown;
+pub mod timed;
 pub mod typing;
 
 /// Devices are addressed by full id, short id ("A1B2-C3D4") or name; `pair` also takes
