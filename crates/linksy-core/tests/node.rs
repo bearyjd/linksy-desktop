@@ -2421,3 +2421,146 @@ async fn a_device_without_room_says_so_when_it_declines() {
     assert!(reason.contains("Beta doesn't have room for this"), "{reason}");
     assert!(reason.contains("4.1 KB"), "{reason}");
 }
+
+// Typing on the phone (docs/protocol.md "Typing on the phone"): a computer opens an `input`
+// session to a phone, which hands the text and key frames to its app.
+mod keyboard {
+    use super::*;
+    use linksy_core::keyboard::{KeyInput, KEYBOARD_QUEUE, MAX_HELD_KEYS, MAX_KEYBOARD_FRAME, MAX_KEYBOARD_TEXT};
+
+    /// Alpha is a computer, Beta a phone that says it takes typing only when `keyboard`.
+    async fn computer_and_phone(keyboard: bool) -> (Dev, Dev) {
+        paired_with(|c| {
+            if c.name == "Beta" {
+                c.kind = linksy_core::DeviceKind::Phone;
+                if keyboard {
+                    c.features = vec!["keyboard".into()];
+                }
+            }
+        })
+        .await
+    }
+
+    async fn typing(keyboard: bool) -> (linksy_core::Session, linksy_core::keyboard::KeyboardInput, Dev, Dev) {
+        let (pc, phone) = computer_and_phone(keyboard).await;
+        let mut incoming = phone.node.incoming_sessions().unwrap();
+        let remote = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await.unwrap();
+        let session = incoming.recv().await.unwrap();
+        (remote, session.keyboard_input(), pc, phone)
+    }
+
+    async fn next(k: &mut linksy_core::keyboard::KeyboardInput) -> Option<KeyInput> {
+        tokio::time::timeout(Duration::from_secs(5), k.next()).await.expect("no keyboard event")
+    }
+
+    fn key(keysym: u32, pressed: bool) -> ControlMsg {
+        ControlMsg::Key { keysym, pressed, code: None }
+    }
+
+    async fn send(remote: &mut linksy_core::Session, msgs: &[ControlMsg]) {
+        for m in msgs {
+            remote.send.write_all(&linksy_core::protocol::control_frame(m)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_phone_without_the_keyboard_declines_input_as_unsupported() {
+        let (pc, phone) = computer_and_phone(false).await;
+        let _incoming = phone.node.incoming_sessions().unwrap();
+        let err = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await.err().expect("must be declined");
+        assert!(matches!(err, Error::Unsupported), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_phone_with_the_keyboard_hands_over_text_and_keys_only() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        send(
+            &mut remote,
+            &[
+                ControlMsg::Pointer { x: 0.5, y: 0.5 },
+                ControlMsg::Text { text: "héllo".into() },
+                ControlMsg::Scroll { dx: 0.0, dy: 1.0, discrete: true },
+                key(0xff0d, true),
+                ControlMsg::Button { button: linksy_core::MouseButton::Left, pressed: true },
+                key(0xff0d, false),
+                ControlMsg::TermClose,
+            ],
+        )
+        .await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("héllo".into())));
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 0xff0d, pressed: true }));
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 0xff0d, pressed: false }));
+    }
+
+    #[tokio::test]
+    async fn a_desktop_still_takes_input_without_the_feature() {
+        // The touchpad direction: the receiver is a computer that never says `keyboard`.
+        let (phone, pc) = paired().await;
+        let mut incoming = pc.node.incoming_sessions().unwrap();
+        phone.node.request_session(&pc.node.info().id, SessionKind::Input).await.unwrap();
+        assert!(incoming.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn too_long_text_is_dropped_but_typing_goes_on() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        let long = "x".repeat(MAX_KEYBOARD_TEXT + 1);
+        let fits = "y".repeat(MAX_KEYBOARD_TEXT);
+        send(&mut remote, &[ControlMsg::Text { text: long }, ControlMsg::Text { text: fits.clone() }, ControlMsg::Text { text: "ok".into() }]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text(fits)));
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("ok".into())));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_ends_the_typing() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        send(&mut remote, &[ControlMsg::Text { text: "before".into() }]).await;
+        remote.send.write_all(&((MAX_KEYBOARD_FRAME as u32 + 1).to_be_bytes())).await.unwrap();
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("before".into())));
+        assert_eq!(next(&mut kb).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_flood_fills_a_bounded_queue_and_drops_the_rest() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        let total = KEYBOARD_QUEUE * 4;
+        for i in 0..total {
+            send(&mut remote, &[ControlMsg::Text { text: format!("t{i}") }]).await;
+        }
+        remote.send.finish().unwrap();
+        // The app hasn't read anything yet: only what fits was kept, the oldest first.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut got = Vec::new();
+        while let Some(KeyInput::Text(t)) = next(&mut kb).await {
+            got.push(t);
+        }
+        assert_eq!(got.len(), KEYBOARD_QUEUE);
+        assert_eq!(got[0], "t0");
+    }
+
+    #[tokio::test]
+    async fn keys_still_held_when_the_session_ends_are_released() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        // A release of a key never pressed is not passed on.
+        send(&mut remote, &[key(99, false), key(65, true), key(66, true), key(65, false)]).await;
+        remote.send.finish().unwrap();
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: true }));
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 66, pressed: true }));
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: false }));
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 66, pressed: false }));
+        assert_eq!(next(&mut kb).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_distinct_held_keys_is_capped_and_still_released() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        let presses: Vec<_> = (0..MAX_HELD_KEYS as u32 + 10).map(|k| key(1000 + k, true)).collect();
+        send(&mut remote, &presses).await;
+        remote.send.finish().unwrap();
+        let (mut down, mut up) = (0, 0);
+        while let Some(KeyInput::Key { pressed, .. }) = next(&mut kb).await {
+            if pressed { down += 1 } else { up += 1 }
+        }
+        assert_eq!((down, up), (MAX_HELD_KEYS, MAX_HELD_KEYS));
+    }
+}
