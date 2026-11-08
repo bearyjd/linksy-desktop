@@ -19,10 +19,12 @@ Linksy for Linux. Each version's section becomes its release notes.
   Keys never stay down on the phone (a release is tied to the key's press, not to the
   modifiers held later, also when a held key repeats as another keysym), a Ctrl/Alt/Shift
   held before the window saw it is sent before the key, the window never waits on the
-  service, and Stop sends what was typed before the session ends. `linksy type` writes with
-  a time limit, waits 2 s after the text to see the phone kept the session, exits non-zero
-  if it ended before the text was written or the service did not finish passing it on, and
-  its stdin is limited to 100 KiB. Very large pastes are not paced (see protocol §4.26).
+  service, and Stop sends what was typed and waits for the service to say it passed it on
+  before the session ends (closing the last window doesn't drop that). `linksy type` writes
+  with a time limit, waits 2 s after the text to see the phone kept the session, exits
+  non-zero (with the hint to turn Linksy Keyboard on) if the phone ended the session within
+  2 s of it starting, even when the text had been written, or if the service did not finish
+  passing it on, and its stdin is limited to 100 KiB. Very large pastes are not paced (see protocol §4.26).
   The new strings were translated by an AI and want a native review.
   Not tried on a phone. The Qt app doesn't offer it yet.
 

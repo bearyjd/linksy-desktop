@@ -2155,19 +2155,30 @@ phone is the receiver and hands them to its app. No new session kind and no new 
   holds that a later key event shows is no longer down is released too (an input method may
   swallow a modifier's release, e.g. Ctrl+Shift+U; unverified without a display); a Ctrl,
   Alt or Shift held before the window saw it go down (focus came back, or the session began
-  with it held) is sent as a press before the key it modifies, and let go like any other. A
-  held key that repeats under another keysym (Shift joined) is released under the first
+  with it held) is sent as a press before the key it modifies, and let go like any other:
+  when the real key then goes down, the same keysym (Left Ctrl) is handed over without a
+  second press, and the other side (Right Ctrl) lets the first one go up before its own press.
+  A held key that repeats under another keysym (Shift joined) is released under the first
   before the new one goes down. Pasted text
   goes with held modifiers released around it, and restored after if still held. Alt+F4
   closes the window and is not sent. A session that is declined, times out or ends within 2 s
   is shown as "not supported" with the hint to turn Linksy Keyboard on in the phone's app; the
   window sends from a thread of its own and shows "Lost connection" if a write fails. Stop
   (or closing the window) is ordered: what was typed is sent, held keys are released (within
-  2 s of the stop), the connection closes, and only then is the session ended, because the
-  service stops relaying the moment it ends; a writer that has not finished after 3 s is cut
-  off and the session ended anyway. `linksy type` writes everything (each write bounded),
-  then watches 2 s for the phone ending the session: ending it before the text was written
-  is "not supported"; ending it after is not a failure (the phone took the text). It then
+  2 s of the stop), the window closes only its own half of the connection, the service closes
+  its half once it has passed everything on, and only then is the session ended, because the
+  service stops relaying the moment it ends. The program is kept running until then (closing
+  the last window does not drop it). The wait is checked every 3 s: a check that finds no
+  progress (nothing more sent, nothing finished) cuts the connection and ends the session
+  anyway; one that finds some waits another 3 s, at most 4 times (15 s in all, best effort
+  beyond that). `linksy type` writes everything (each write bounded),
+  then watches 2 s for the phone ending the session. A close within 2 s of the session
+  starting (including before the text was written) counts as not delivered, the same as in
+  the window: a phone with Linksy Keyboard off ends the session right after Allow, and a short
+  text is written before that close arrives, so the two look alike on the wire. The command
+  exits non-zero with the hint to turn Linksy Keyboard on, and says that if the text did
+  arrive it was typed but the phone closed the session right after. A session that stayed
+  open past the window, or that the phone closed after it, is not a failure. It then
   closes its end and waits for the service to close its own, which means everything was
   passed on; if that does not happen the command exits non-zero ("may not have got all of
   it"). It ends the session on every error path. Its stdin is limited to 100 KiB (an error
