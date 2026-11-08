@@ -2,6 +2,14 @@
 
 Linksy for Linux. Each version's section becomes its release notes.
 
+## Unreleased
+
+### New
+- **Typing on the phone, core half:** a phone that announces the feature `keyboard`
+  takes an `input` session from a computer and passes the text and key presses to its
+  app, within fixed limits (frame size, text length, queue, held keys). Without the
+  feature the phone declines. Nothing uses it yet.
+
 ## 0.13.1
 
 ### Fixed

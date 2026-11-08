@@ -873,7 +873,8 @@ before a send, §4.22; computers announce it too), `apps` (sends and installs ap
 `snap` (opens its camera when a computer asks, §4.23), `sound` (shares the sound it plays
 while a computer shows its screen, §4.8), `phone_controls` (a phone's volumes,
 ringer, Do Not Disturb and flashlight, §4.24), `computer_notifications` (a phone that shows
-the notifications of a computer, §4.25).
+the notifications of a computer, §4.25), `keyboard` (a phone whose user lets computers type
+on it, §4.26).
 Set `Config.features` in the core. To change them while running (`notifications` turned
 on or off), call `Node::set_features`: connected devices get a `features` message
 (at most 64 names of up to 64 bytes) and update at once, others see the new list at the
@@ -2091,6 +2092,34 @@ What comes up on a computer comes up on a phone that asked for it. Feature
   the switch isn't shown there.
 - **Core API:** `node.send_computer_notification(id, key, app, title, body, at_ms)`;
   `Event::ComputerNotification`.
+
+### 4.26 Typing on the phone (desktop, after 0.13.1; not tried on a phone)
+
+A computer types into the phone's focused field. It uses the existing `input` session
+(§4.11) in the other direction: the computer is the requester and sends the frames, the
+phone is the receiver and hands them to its app. No new session kind and no new message.
+
+- **Capability:** the phone announces the feature `keyboard` only while its user has turned
+  typing on (and the app can type, for example through its own input method). It is off by
+  default: a phone (or tablet) without it answers `session_decline` with
+  `reason: "unsupported"` (core does this). Computers always accept `input` (the touchpad).
+  Old phones ignore the request the same way, so mixed versions are safe.
+- **Frames:** the usual control frames (u32 length + JSON). Only `text` and `key`
+  (`keysym`, `pressed`) count; `pointer`, `pointer_by`, `button`, `scroll` and the rest are
+  ignored. Keys are X11 keysyms.
+- **Limits** (core, `linksy_core::keyboard`): a frame body over 4096 bytes ends the session;
+  a `text` over 1024 bytes (or empty) is dropped; the app's queue holds 256 events, and
+  text or presses that arrive while it is full are dropped (the oldest are kept); at most
+  32 keys held at once, more presses are ignored. A release is never dropped, and one for a
+  key that was not pressed is ignored.
+- **Disconnect:** keys still down when the session ends (or the app stops reading) are
+  released before the stream ends, so none stays stuck.
+- **Consent:** like any `input` session, it asks the user unless they allowed that
+  computer for good; from away it always asks (§4.13).
+- **Core API:** `Session::keyboard_input(self) -> KeyboardInput`, then
+  `KeyboardInput::next().await -> Option<KeyInput>` (`KeyInput::Text(String)` or
+  `KeyInput::Key { keysym, pressed }`). Add `"keyboard"` to `Config.features` or
+  `Node::set_features` when the app can type.
 
 ## 5. Core API the app would call (`linksy_core::Node`)
 
