@@ -641,20 +641,7 @@ fn paired(node: &Node, target: &str) -> Result<Fingerprint, String> {
 }
 
 fn resolve(node: &Node, target: &str) -> Result<Fingerprint, String> {
-    if let Ok(fp) = target.parse::<Fingerprint>() {
-        return Ok(fp);
-    }
-    let t = target.trim();
-    let matches: Vec<_> = node
-        .devices()
-        .into_iter()
-        .filter(|d| d.device.id.short().eq_ignore_ascii_case(t) || d.device.name.eq_ignore_ascii_case(t))
-        .collect();
-    match matches.as_slice() {
-        [one] => Ok(one.device.id),
-        [] => Err(format!("No device called \"{t}\". Run `linksy devices` to see what's nearby.")),
-        _ => Err(format!("Several devices are called \"{t}\". Use the device id instead.")),
-    }
+    linksy_ipc::resolve::resolve_device(&node.devices(), target)
 }
 
 fn device(node: &Node, id: &Fingerprint) -> Option<linksy_core::DeviceInfo> {

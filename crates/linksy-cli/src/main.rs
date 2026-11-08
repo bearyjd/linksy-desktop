@@ -8,6 +8,8 @@ use linksy_ipc::linksy_core::{DeviceKind, Direction, Event};
 use linksy_ipc::{Client, ClientError};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod type_cmd;
+
 const HELP: &str = "linksy — share between your devices
 
 Usage:
@@ -24,6 +26,8 @@ Usage:
   linksy send <device> <files…>      send files or folders
   linksy notify <device> <title> [body]
   linksy clip <device> [text]        share text to its clipboard (default: stdin)
+  linksy type <phone> [text]         type into the phone's focused field (default: stdin, a
+                                     final newline is Enter); needs Linksy Keyboard on the phone
   linksy open <device> <url>         open a web link in its browser
   linksy ring <device> [--stop]      make it ring so you can find it
   linksy locate <phone>              ask a phone where it is (it can say no)
@@ -422,6 +426,7 @@ async fn run(c: &Client, cmd: &str, rest: &[String]) -> Result<(), String> {
             c.send_clipboard(to.clone(), text).await.map_err(err)?;
             println!("Shared clipboard with {to}.");
         }
+        ("type", [to, text @ ..]) => type_cmd::run(c, to, text).await?,
         ("invite", []) => {
             let uri = c.create_invite().await.map_err(err)?;
             let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| e.to_string())?;

@@ -10,7 +10,23 @@ Linksy for Linux. Each version's section becomes its release notes.
   app, within fixed limits (frame size, text length, queue, held keys). Without the
   feature the phone declines. It always asks the phone's user, ends as soon as typing is
   turned off (also when turned off and on again: a session started before the
-  turn-off ends), and never waits on the app to read. Nothing uses it yet.
+  turn-off ends), and never waits on the app to read.
+- **Type on Phone** (GTK app and `linksy type <phone>`): on a phone that announces
+  `keyboard`, a small "Typing on <phone>" window sends what you type (and paste, and
+  input-method text) to the field the phone has focused; `linksy type` reads stdin. The
+  phone always asks. A phone that declines, doesn't answer or closes at once is told
+  apart from "typing is off" only by the hint to turn Linksy Keyboard on in its app.
+  Keys never stay down on the phone (a release is tied to the key's press, not to the
+  modifiers held later, also when a held key repeats as another keysym), a Ctrl/Alt/Shift
+  held before the window saw it is sent before the key, the window never waits on the
+  service, and Stop sends what was typed and waits for the service to say it passed it on
+  before the session ends (closing the last window doesn't drop that). `linksy type` writes
+  with a time limit, waits 2 s after the text to see the phone kept the session, exits
+  non-zero (with the hint to turn Linksy Keyboard on) if the phone ended the session within
+  2 s of it starting, even when the text had been written, or if the service did not finish
+  passing it on, and its stdin is limited to 100 KiB. Very large pastes are not paced (see protocol §4.26).
+  The new strings were translated by an AI and want a native review.
+  Not tried on a phone. The Qt app doesn't offer it yet.
 
 ## 0.13.1
 

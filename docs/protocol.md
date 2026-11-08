@@ -2144,6 +2144,50 @@ phone is the receiver and hands them to its app. No new session kind and no new 
   `KeyboardInput::next().await -> Option<KeyInput>` (`KeyInput::Text(String)` or
   `KeyInput::Key { keysym, pressed }`; its `Debug` shows a text's length only). Add
   `"keyboard"` to `Config.features` or `Node::set_features` when the app can type.
+- **The desktop as requester** (`linksy_ipc::typing`, the GTK "Type on Phone" window,
+  `linksy type`): offered only for a phone or tablet that announces `keyboard` (an empty
+  feature list is not enough). Printable keys, input-method text and paste go as `text`,
+  at most 1024 bytes each (a paste is cut at 100 KiB); Enter, Backspace, arrows, F-keys and
+  Shift/Ctrl/Alt (and shortcuts with Ctrl or Alt held) go as `key` presses and releases;
+  Super, Meta, Caps/Num Lock and AltGr are not sent; keys still down are released when the
+  window loses focus or stops. A key's release is always sent for the keysym its press sent
+  (tracked by physical key code), whatever modifiers are held by then; a modifier the phone
+  holds that a later key event shows is no longer down is released too (an input method may
+  swallow a modifier's release, e.g. Ctrl+Shift+U; unverified without a display); a Ctrl,
+  Alt or Shift held before the window saw it go down (focus came back, or the session began
+  with it held) is sent as a press before the key it modifies, and let go like any other:
+  when the real key then goes down, the same keysym (Left Ctrl) is handed over without a
+  second press, and the other side (Right Ctrl) lets the first one go up before its own press.
+  A held key that repeats under another keysym (Shift joined) is released under the first
+  before the new one goes down. Pasted text
+  goes with held modifiers released around it, and restored after if still held. Alt+F4
+  closes the window and is not sent. A session that is declined, times out or ends within 2 s
+  is shown as "not supported" with the hint to turn Linksy Keyboard on in the phone's app; the
+  window sends from a thread of its own and shows "Lost connection" if a write fails. Stop
+  (or closing the window) is ordered: what was typed is sent, held keys are released (within
+  2 s of the stop), the window closes only its own half of the connection, the service closes
+  its half once it has passed everything on, and only then is the session ended, because the
+  service stops relaying the moment it ends. The program is kept running until then (closing
+  the last window does not drop it). The wait is checked every 3 s: a check that finds no
+  progress (nothing more sent, nothing finished) cuts the connection and ends the session
+  anyway; one that finds some waits another 3 s, at most 4 times (15 s in all, best effort
+  beyond that). `linksy type` writes everything (each write bounded),
+  then watches 2 s for the phone ending the session. A close within 2 s of the session
+  starting (including before the text was written) counts as not delivered, the same as in
+  the window: a phone with Linksy Keyboard off ends the session right after Allow, and a short
+  text is written before that close arrives, so the two look alike on the wire. The command
+  exits non-zero with the hint to turn Linksy Keyboard on, and says that if the text did
+  arrive it was typed but the phone closed the session right after. A session that stayed
+  open past the window, or that the phone closed after it, is not a failure. It then
+  closes its end and waits for the service to close its own, which means everything was
+  passed on; if that does not happen the command exits non-zero ("may not have got all of
+  it"). It ends the session on every error path. Its stdin is limited to 100 KiB (an error
+  beyond that); the target is resolved like the service does (name, short id or fingerprint,
+  spaces ignored) before the `keyboard` check.
+  Limit: a paste is not paced. The phone queues 256 frames and drops what is beyond that
+  (releases are kept), so several large pastes in quick succession, or one to a phone that is
+  busy, can lose text, or lose the press that restores a modifier after a paste; the
+  desktop cannot tell, because the phone sends no acknowledgement. Paste in pieces.
 
 ## 5. Core API the app would call (`linksy_core::Node`)
 

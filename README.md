@@ -101,6 +101,9 @@ Finish Setup doesn't look: it shows the firewall as to set up until Linksy has o
 - **Share.** Files and folders both ways, resumable and checked; the clipboard (text, images,
   small files), automatically where the desktop allows; notifications. "Send with Linksy" in
   Files, Dolphin and Thunar.
+- **Type on the phone** from the computer's keyboard (paste works), into whatever field
+  the phone has focused: "Type on Phone" on its page, or `linksy type`. It needs Linksy
+  Keyboard turned on in the phone's app, and the phone asks every time.
 - **Use the phone as** a second display for the computer, a webcam ("Linksy Camera" in every
   app, with the phone's camera controls) or a microphone ("Linksy Microphone").
 - **Screens.** Watch another device's screen and take control of it, each asked for
@@ -222,6 +225,7 @@ linksy devices             # or the CLI
 linksy pair "Other Laptop"
 linksy send "Other Laptop" ~/Pictures/photo.jpg
 linksy clip "Other Laptop" "some text"
+echo "hello" | linksy type "My Phone"   # types into the phone's focused field
 linksy settings auto-accept on
 ```
 

@@ -46,7 +46,7 @@ On main and not in a release yet:
 - **Phone to phone** (§4.22): the route a transfer takes, a check before sending, sending apps. The computer side is done; the phone side is in progress.
 - Day headings in the Gallery ("Today", "Yesterday", "Nov 2"), a seek bar that works for browser music, and a service that starts again after a crash.
 
-- **Typing on the phone** (§4.26): the core half is on a branch (a phone that announces `keyboard` takes `text` and `key` frames from a computer over an `input` session, with limits). The computer's "Type on Phone" action and the phone's input method are to do; not tried on a phone.
+- **Typing on the phone** (§4.26): the core half is merged (a phone that announces `keyboard` takes `text` and `key` frames from a computer over an `input` session, with limits), and the GTK app's "Type on Phone" window and `linksy type` are on a branch. The Qt app's action and the phone's input method are to do; not tried on a phone.
 
 Built on the phone, not published (from the phone's side; the desktop has not seen its messages yet):
 - **Snap to Computer** and **Copy to Computer**, the phone's half of the **Connection Doctor**, and a **USB button** (`usb_plugged`, `usb_connect`, which the computer already answers).
