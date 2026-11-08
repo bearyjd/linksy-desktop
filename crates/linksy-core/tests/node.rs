@@ -2428,17 +2428,64 @@ mod keyboard {
     use super::*;
     use linksy_core::keyboard::{KeyInput, KEYBOARD_QUEUE, MAX_HELD_KEYS, MAX_KEYBOARD_FRAME, MAX_KEYBOARD_TEXT};
 
+    use linksy_core::DeviceKind;
+
+    fn as_beta(c: &mut Config, kind: DeviceKind, keyboard: bool) {
+        if c.name == "Beta" {
+            c.kind = kind;
+            if keyboard {
+                c.features = vec!["keyboard".into()];
+            }
+        }
+    }
+
     /// Alpha is a computer, Beta a phone that says it takes typing only when `keyboard`.
     async fn computer_and_phone(keyboard: bool) -> (Dev, Dev) {
-        paired_with(|c| {
-            if c.name == "Beta" {
-                c.kind = linksy_core::DeviceKind::Phone;
-                if keyboard {
-                    c.features = vec!["keyboard".into()];
+        paired_with(|c| as_beta(c, DeviceKind::Phone, keyboard)).await
+    }
+
+    /// Like [`computer_and_phone`] with typing on, but nobody answers the phone's
+    /// `SessionRequest`s: the test does.
+    async fn computer_and_asking_phone() -> (Dev, Dev) {
+        let pc = dev("Alpha").await;
+        let phone = dev_with("Beta", |c| as_beta(c, DeviceKind::Phone, true)).await;
+        auto_answer(&pc.node, true);
+        let mut rx = phone.node.subscribe();
+        let node = phone.node.clone();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let Event::PairingRequest { request, .. } = ev {
+                    node.respond(request, true);
+                }
+            }
+        });
+        let mut rp = phone.node.subscribe();
+        let mut addr = phone.node.local_addr().unwrap();
+        if addr.ip().is_unspecified() {
+            addr.set_ip(std::net::Ipv6Addr::LOCALHOST.into());
+        }
+        pc.node.pair(addr).await.unwrap();
+        wait_for(&mut rp, |e| matches!(e, Event::Connected { .. }).then_some(())).await;
+        (pc, phone)
+    }
+
+    /// The phone's `SessionEnded` for `id`, soon: never waiting on the app to read.
+    async fn ended(rx: &mut broadcast::Receiver<Event>, id: uuid::Uuid) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(Event::SessionEnded { session }) = rx.recv().await
+                    && session == id
+                {
+                    return;
                 }
             }
         })
         .await
+        .expect("the session did not end");
+    }
+
+    fn asked(rx: &mut broadcast::Receiver<Event>) -> bool {
+        std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e, Event::SessionRequest { kind: SessionKind::Input, .. }))
     }
 
     async fn typing(keyboard: bool) -> (linksy_core::Session, linksy_core::keyboard::KeyboardInput, Dev, Dev) {
@@ -2467,8 +2514,171 @@ mod keyboard {
     async fn a_phone_without_the_keyboard_declines_input_as_unsupported() {
         let (pc, phone) = computer_and_phone(false).await;
         let _incoming = phone.node.incoming_sessions().unwrap();
+        let mut rp = phone.node.subscribe();
         let Err(err) = pc.node.request_session(&phone.node.info().id, SessionKind::Input).await else { panic!("must be declined") };
         assert!(matches!(err, Error::Unsupported), "{err:?}");
+        // Declined before the phone's user is ever asked.
+        assert!(!asked(&mut rp), "a phone without the keyboard must not ask");
+    }
+
+    #[tokio::test]
+    async fn a_tablet_takes_typing_only_with_the_keyboard() {
+        for keyboard in [false, true] {
+            let (pc, tablet) = paired_with(|c| as_beta(c, DeviceKind::Tablet, keyboard)).await;
+            let mut incoming = tablet.node.incoming_sessions().unwrap();
+            let got = pc.node.request_session(&tablet.node.info().id, SessionKind::Input).await;
+            if keyboard {
+                got.expect("a tablet with the keyboard takes typing");
+                assert!(incoming.recv().await.is_some());
+            } else {
+                assert!(matches!(got, Err(Error::Unsupported)), "{got:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_on_a_phone_asks_even_when_the_computer_is_allowed_for_good() {
+        let (pc, phone) = computer_and_phone(true).await;
+        let _incoming = phone.node.incoming_sessions().unwrap();
+        phone.node.set_allow_screen(&pc.node.info().id, true).unwrap();
+        let mut rp = phone.node.subscribe();
+        pc.node.request_session(&phone.node.info().id, SessionKind::Input).await.expect("accepted when asked");
+        assert!(asked(&mut rp), "typing on a phone must always ask");
+    }
+
+    #[tokio::test]
+    async fn a_computer_allowed_for_good_still_takes_the_touchpad_without_asking() {
+        let (phone, pc) = paired().await;
+        let _incoming = pc.node.incoming_sessions().unwrap();
+        pc.node.set_allow_screen(&phone.node.info().id, true).unwrap();
+        let mut rc = pc.node.subscribe();
+        phone.node.request_session(&pc.node.info().id, SessionKind::Input).await.unwrap();
+        assert!(!asked(&mut rc), "a computer allowed for good is not asked");
+    }
+
+    #[tokio::test]
+    async fn typing_turned_off_while_asking_is_declined() {
+        let (pc, phone) = computer_and_asking_phone().await;
+        let _incoming = phone.node.incoming_sessions().unwrap();
+        let mut rp = phone.node.subscribe();
+        let (node, to) = (pc.node.clone(), phone.node.info().id);
+        let call = tokio::spawn(async move { node.request_session(&to, SessionKind::Input).await });
+        let request = wait_for(&mut rp, |e| match e {
+            Event::SessionRequest { request, kind: SessionKind::Input, .. } => Some(*request),
+            _ => None,
+        })
+        .await;
+        phone.node.set_features(vec![]).await;
+        phone.node.respond(request, true);
+        let got = call.await.unwrap();
+        assert!(got.is_err(), "typing was turned off before the yes: {got:?}");
+    }
+
+    #[tokio::test]
+    async fn typing_turned_off_ends_the_typing_and_lets_go_of_keys() {
+        let (mut remote, mut kb, _pc, phone) = typing(true).await;
+        let mut rp = phone.node.subscribe();
+        send(&mut remote, &[key(65, true)]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: true }));
+        phone.node.set_features(vec![]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: false }));
+        assert_eq!(next(&mut kb).await, None);
+        ended(&mut rp, kb.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_ends_the_session_even_when_the_app_is_not_reading() {
+        let (mut remote, mut kb, _pc, phone) = typing(true).await;
+        let mut rp = phone.node.subscribe();
+        send(&mut remote, &[key(65, true)]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Key { keysym: 65, pressed: true }));
+        // The app stops reading: the queue fills, then the release and the end come.
+        let flood: Vec<_> = (0..KEYBOARD_QUEUE * 2).map(|i| ControlMsg::Text { text: format!("t{i}") }).collect();
+        send(&mut remote, &flood).await;
+        send(&mut remote, &[key(65, false)]).await;
+        remote.send.finish().unwrap();
+        ended(&mut rp, kb.id).await;
+        let mut got = Vec::new();
+        while let Some(input) = next(&mut kb).await {
+            got.push(input);
+        }
+        assert_eq!(got.iter().filter(|i| matches!(i, KeyInput::Text(_))).count(), KEYBOARD_QUEUE);
+        assert_eq!(got.last(), Some(&KeyInput::Key { keysym: 65, pressed: false }), "the release is never lost");
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_stalls_halfway_ends_the_typing_but_a_pause_does_not() {
+        // docs/protocol.md §4.26: a frame begun must be complete within 10 s.
+        const KEYBOARD_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        send(&mut remote, &[ControlMsg::Text { text: "a".into() }]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("a".into())));
+        // Nothing sent for longer than the frame timeout: still typing.
+        tokio::time::sleep(KEYBOARD_FRAME_TIMEOUT + Duration::from_secs(1)).await;
+        send(&mut remote, &[ControlMsg::Text { text: "b".into() }]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("b".into())));
+        // Half a frame, then nothing: the session ends.
+        let frame = linksy_core::protocol::control_frame(&ControlMsg::Text { text: "stalled".into() });
+        remote.send.write_all(&frame[..frame.len() - 3]).await.unwrap();
+        let end = tokio::time::timeout(KEYBOARD_FRAME_TIMEOUT * 2, kb.next()).await.expect("a stalled frame must not hold the session");
+        assert_eq!(end, None);
+    }
+
+    #[tokio::test]
+    async fn text_of_control_characters_at_the_limit_is_dropped_not_fatal() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        let controls = "\u{1}".repeat(MAX_KEYBOARD_TEXT);
+        send(&mut remote, &[ControlMsg::Text { text: controls.clone() }, ControlMsg::Text { text: "ok".into() }]).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("ok".into())));
+        // JSON escapes each as `\u0001`: the frame really is bigger than the text limit.
+        let body = linksy_core::protocol::control_frame(&ControlMsg::Text { text: controls }).len() - 4;
+        assert!(body > 4096 && body <= MAX_KEYBOARD_FRAME, "{body}");
+    }
+
+    #[tokio::test]
+    async fn control_characters_other_than_tab_and_newline_are_stripped() {
+        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
+        let texts = ["a\u{1}b\rc\td\ne\u{1b}\u{7f}", "\u{7}\u{8}", "end"];
+        let msgs: Vec<_> = texts.iter().map(|t| ControlMsg::Text { text: (*t).into() }).collect();
+        send(&mut remote, &msgs).await;
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("abc\td\ne".into())));
+        // Nothing left: dropped.
+        assert_eq!(next(&mut kb).await, Some(KeyInput::Text("end".into())));
+    }
+
+    #[test]
+    fn debug_never_shows_what_was_typed() {
+        let shown = format!("{:?}", KeyInput::Text("hunter2".into()));
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains('7'), "the length is shown: {shown}");
+    }
+
+    /// From away a phone takes typing only from a computer allowed from away, and asks.
+    #[cfg(feature = "away")]
+    #[tokio::test]
+    async fn typing_from_away_is_refused_then_always_asked() {
+        let (pc, phone) = paired_with(|c| {
+            c.idle_after = Duration::from_millis(1500);
+            c.away = true;
+            as_beta(c, DeviceKind::Phone, true);
+        })
+        .await;
+        let (idc, idp) = (pc.node.info().id, phone.node.info().id);
+        if phone.node.info().away.is_none_or(|w| w.addrs.is_empty()) {
+            return eprintln!("no network address: skipped");
+        }
+        let mut rc = pc.node.subscribe();
+        wait_for(&mut rc, |e| matches!(e, Event::Disconnected { .. }).then_some(())).await;
+        pc.node.connect_away(&idp).await.expect("away connection");
+        assert_eq!(pc.node.link(&idp), Some(Link::Away));
+        let _incoming = phone.node.incoming_sessions().unwrap();
+        phone.node.set_allow_screen(&idc, true).unwrap();
+        let err = pc.node.request_session(&idp, SessionKind::Input).await.unwrap_err();
+        assert!(matches!(err, Error::NotFromAway), "{err:?}");
+        phone.node.set_away_all(&idc, true).unwrap();
+        let mut rp = phone.node.subscribe();
+        pc.node.request_session(&idp, SessionKind::Input).await.expect("allowed from away");
+        assert!(asked(&mut rp), "not asked from away");
     }
 
     #[tokio::test]
@@ -2522,20 +2732,21 @@ mod keyboard {
 
     #[tokio::test]
     async fn a_flood_fills_a_bounded_queue_and_drops_the_rest() {
-        let (mut remote, mut kb, _pc, _phone) = typing(true).await;
-        let total = KEYBOARD_QUEUE * 4;
-        for i in 0..total {
-            send(&mut remote, &[ControlMsg::Text { text: format!("t{i}") }]).await;
-        }
+        let (mut remote, mut kb, _pc, phone) = typing(true).await;
+        let mut rp = phone.node.subscribe();
+        let flood: Vec<_> = (0..KEYBOARD_QUEUE * 4).map(|i| ControlMsg::Text { text: format!("t{i}") }).collect();
+        send(&mut remote, &flood).await;
         remote.send.finish().unwrap();
-        // The app hasn't read anything yet: only what fits was kept, the oldest first.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The app hasn't read anything when the whole flood is in: only what fits was kept,
+        // the oldest first.
+        ended(&mut rp, kb.id).await;
         let mut got = Vec::new();
         while let Some(KeyInput::Text(t)) = next(&mut kb).await {
             got.push(t);
         }
         assert_eq!(got.len(), KEYBOARD_QUEUE);
         assert_eq!(got[0], "t0");
+        assert_eq!(got[KEYBOARD_QUEUE - 1], format!("t{}", KEYBOARD_QUEUE - 1));
     }
 
     #[tokio::test]
