@@ -16,6 +16,10 @@ Linksy for Linux. Each version's section becomes its release notes.
   input-method text) to the field the phone has focused; `linksy type` reads stdin. The
   phone always asks. A phone that declines, doesn't answer or closes at once is told
   apart from "typing is off" only by the hint to turn Linksy Keyboard on in its app.
+  Keys never stay down on the phone (a release is tied to the key's press, not to the
+  modifiers held later), the window never waits on the service, `linksy type` waits 2 s to
+  see the phone kept the session and exits non-zero otherwise, and its stdin is limited to
+  100 KiB.
   Not tried on a phone. The Qt app doesn't offer it yet.
 
 ## 0.13.1

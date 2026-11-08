@@ -166,6 +166,8 @@ pub struct Window {
     corner: Rc<corner::Corner>,
     transfers: Rc<transfers::TransfersPage>,
     island: Rc<island::Island>,
+    /// Open "Type on Phone" windows, one per phone.
+    typers: RefCell<HashMap<Fingerprint, typing::Typer>>,
 }
 
 impl Window {
@@ -364,6 +366,7 @@ impl Window {
             corner,
             transfers,
             island,
+            typers: RefCell::default(),
         });
         let w = Rc::downgrade(&win);
         win.transfers.set_handler(move |action| {

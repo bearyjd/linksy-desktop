@@ -3,11 +3,11 @@
 //! wires GTK's keys, input method and clipboard to it.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::io::Write;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::rc::{Rc, Weak};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -16,36 +16,101 @@ use gtk::{gdk, glib};
 use linksy_i18n::t;
 use linksy_ipc::linksy_core::protocol::control_frame;
 use linksy_ipc::linksy_core::{ControlMsg, Fingerprint, SessionKind, Uuid};
-use linksy_ipc::typing::{KeyAction, Mods, Phase, Problem, Step, map_key, paste_messages, text_messages};
+use linksy_ipc::typing::{KeyAction, KeyTracker, Mods, Phase, Problem, Step, paste_messages, text_messages};
 
 use super::Window;
 
-/// How long a write may wait for the service before the session counts as lost.
+/// How long one write may wait for the service before the session counts as lost.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long in all letting go of held keys may take.
+const RELEASE_DEADLINE: Duration = Duration::from_secs(2);
+/// What may wait to be written (a paste is one job); a phone slower than this is lost.
+const QUEUE: usize = 64;
+
+/// Work for the thread that writes to the service, so the window never waits on a socket.
+enum Job {
+    /// Frames to send, each within [`WRITE_TIMEOUT`].
+    Write(Vec<Vec<u8>>),
+    /// Frames to send within [`RELEASE_DEADLINE`] altogether.
+    Release(Vec<Vec<u8>>),
+    /// Everything before it is sent: close the connection.
+    Close,
+}
+
+/// Writes jobs in order until `Close`, the window letting go of the queue, or the first
+/// failed write (the rest is dropped). Tells the window when a write failed.
+fn spawn_writer(mut stream: UnixStream, failed: async_channel::Sender<()>) -> SyncSender<Job> {
+    let (tx, rx) = sync_channel(QUEUE);
+    std::thread::spawn(move || {
+        if !write_jobs(&mut stream, &rx) {
+            let _ = failed.send_blocking(());
+        }
+        let _ = stream.shutdown(Shutdown::Both);
+    });
+    tx
+}
+
+fn write_jobs(stream: &mut UnixStream, jobs: &Receiver<Job>) -> bool {
+    while let Ok(job) = jobs.recv() {
+        match job {
+            Job::Write(frames) => {
+                if frames.iter().any(|f| stream.write_all(f).is_err()) {
+                    return false;
+                }
+            }
+            Job::Release(frames) => {
+                let deadline = Instant::now() + RELEASE_DEADLINE;
+                for frame in frames {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() || stream.set_write_timeout(Some(left)).is_err() || stream.write_all(&frame).is_err() {
+                        return false;
+                    }
+                }
+                let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+            }
+            Job::Close => return true,
+        }
+    }
+    true
+}
 
 impl Window {
     /// Open the typing window for a phone and ask it (it always asks its user).
     pub(super) fn type_on_phone(self: &Rc<Self>, id: Fingerprint) {
+        // One window per phone: one still going is brought forward, one that is over is replaced
+        let open = self.typers.borrow().get(&id).cloned();
+        if let Some(typer) = open {
+            if typer.live() {
+                typer.window.present();
+                return;
+            }
+            typer.window.close();
+        }
         let name = self.device(&id).map(|d| d.device.name).unwrap_or_default();
         let typer = Typer::open(self, id, &name);
+        self.typers.borrow_mut().insert(id, typer.clone());
         typer.start();
     }
 }
 
 #[derive(Clone)]
-struct Typer {
+pub(super) struct Typer {
     owner: Weak<Window>,
     device: Fingerprint,
     name: String,
-    window: adw::Window,
+    pub(super) window: adw::Window,
     status: adw::StatusPage,
     stop: gtk::Button,
     phase: Rc<RefCell<Phase>>,
     started: Rc<Cell<Option<Instant>>>,
+    /// The connection, kept to shut it down at once when the writer can't be trusted to.
     stream: Rc<RefCell<Option<UnixStream>>>,
+    writer: Rc<RefCell<Option<SyncSender<Job>>>>,
     session: Rc<Cell<Option<Uuid>>>,
-    /// Keys sent as pressed and not yet as released, so none stays down on the phone.
-    held: Rc<RefCell<HashSet<u32>>>,
+    /// Keys the phone holds, so none stays down there.
+    keys: Rc<RefCell<KeyTracker>>,
+    /// A note ("That was a lot") is showing and goes with the next key.
+    notice: Rc<Cell<bool>>,
 }
 
 impl Typer {
@@ -70,8 +135,10 @@ impl Typer {
             phase: Rc::new(RefCell::new(Phase::Asking)),
             started: Rc::default(),
             stream: Rc::default(),
+            writer: Rc::default(),
             session: Rc::default(),
-            held: Rc::default(),
+            keys: Rc::default(),
+            notice: Rc::default(),
         };
         typer.setup_input();
         let t = typer.clone();
@@ -79,11 +146,23 @@ impl Typer {
         let t = typer.clone();
         typer.window.connect_close_request(move |_| {
             t.step(Step::StopPressed);
+            if let Some(owner) = t.owner.upgrade() {
+                // Only its own entry: a newer window for the phone may have replaced it
+                let mut typers = owner.typers.borrow_mut();
+                if typers.get(&t.device).is_some_and(|e| e.window == t.window) {
+                    typers.remove(&t.device);
+                }
+            }
             glib::Propagation::Proceed
         });
         typer.show(&Phase::Asking);
         typer.window.present();
         typer
+    }
+
+    /// Still asking or typing.
+    fn live(&self) -> bool {
+        matches!(*self.phase.borrow(), Phase::Asking | Phase::Typing)
     }
 
     fn start(&self) {
@@ -112,6 +191,20 @@ impl Typer {
 
     fn connected(&self, stream: UnixStream) {
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        // Writes happen on a thread of their own: a slow service never stops the window
+        match stream.try_clone() {
+            Ok(out) => {
+                let (tx, rx) = async_channel::bounded::<()>(1);
+                *self.writer.borrow_mut() = Some(spawn_writer(out, tx));
+                let t = self.clone();
+                glib::spawn_future_local(async move {
+                    if rx.recv().await.is_ok() {
+                        t.write_failed();
+                    }
+                });
+            }
+            Err(e) => return self.step(Step::StartFailed(e.to_string())),
+        }
         // The service closes its end when the phone ends the session: a blocking read in a
         // thread tells. Stopping shuts the socket down, which ends the thread.
         if let Ok(mut reader) = stream.try_clone() {
@@ -138,6 +231,11 @@ impl Typer {
         self.step(Step::Lost { after });
     }
 
+    fn write_failed(&self) {
+        let after = self.started.get().map(|s| s.elapsed()).unwrap_or_default();
+        self.step(Step::WriteFailed { after });
+    }
+
     fn step(&self, step: Step) {
         let before = self.phase.borrow().clone();
         let next = before.clone().next(step);
@@ -151,12 +249,20 @@ impl Typer {
         self.show(&next);
     }
 
-    /// The connection ends here: keys still down are let go first, while it can be told.
+    /// The connection ends here. When it is still good, what was typed is sent first and keys
+    /// still down are let go, then the writer closes it; if that can't be queued, or it is
+    /// already gone, it is shut down now.
     fn close_session(&self, next: &Phase) {
-        if !matches!(next, Phase::Stopped { by_phone: true } | Phase::Failed(_)) {
-            self.release_held();
-        }
-        if let Some(stream) = self.stream.borrow_mut().take() {
+        let writer = self.writer.borrow_mut().take();
+        let stream = self.stream.borrow_mut().take();
+        let good = !matches!(next, Phase::Stopped { by_phone: true } | Phase::Failed(_) | Phase::Disconnected);
+        let closed_by_writer = good
+            && writer.as_ref().is_some_and(|tx| {
+                let up = self.keys.borrow_mut().release_all();
+                let frames = up.iter().map(control_frame).collect();
+                tx.try_send(Job::Release(frames)).is_ok() && tx.try_send(Job::Close).is_ok()
+            });
+        if let Some(stream) = stream.filter(|_| !closed_by_writer) {
             let _ = stream.shutdown(Shutdown::Both);
         }
         self.release_session();
@@ -178,6 +284,7 @@ impl Typer {
             Phase::Failed(Problem::Unsupported) => (t!("{name} can't take typing yet", name), t!("Update Linksy on {name}, then try again.", name)),
             Phase::Failed(Problem::NotAllowed | Problem::EndedAtOnce) => (t!("{name} didn't take it", name), not_enabled(name)),
             Phase::Failed(Problem::NoAnswer) => (t!("No answer").to_string(), not_enabled(name)),
+            Phase::Disconnected => (t!("Lost connection to {name}", name), t!("Nothing more is sent. Close this and choose Type on Phone again.").to_string()),
             Phase::Failed(Problem::Other(e)) => (t!("Couldn't Connect").to_string(), crate::fmt::capitalize(e)),
         };
         self.status.set_title(&title);
@@ -191,7 +298,12 @@ impl Typer {
 
     fn setup_input(&self) {
         // The input method turns key presses into text (accents, compose, IME) and hands
-        // over what it composed; the keys it doesn't take come to `key_pressed`.
+        // over what it composed; the keys it doesn't take come to `key`. It may also take
+        // the release of a modifier used to start composing (Ctrl+Shift+U), so nothing here
+        // relies on seeing it: the next key event names the modifiers really held, and any
+        // the phone holds beyond them are let go (`KeyTracker::release_stale`). Until a next
+        // key arrives, such a modifier stays down on the phone; Stop, closing the window or
+        // losing focus lets it go. Unverified without a display.
         let im = gtk::IMMulticontext::new();
         im.set_client_widget(Some(&self.window));
         let t = self.clone();
@@ -200,10 +312,10 @@ impl Typer {
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.set_im_context(Some(&im));
         let t = self.clone();
-        keys.connect_key_pressed(move |_, key, _, state| t.key(key, state, true));
+        keys.connect_key_pressed(move |_, key, code, state| t.key(key, code, state, true));
         let t = self.clone();
-        keys.connect_key_released(move |_, key, _, state| {
-            t.key(key, state, false);
+        keys.connect_key_released(move |_, key, code, state| {
+            t.key(key, code, state, false);
         });
         self.window.add_controller(keys);
         let focus = gtk::EventControllerFocus::new();
@@ -217,7 +329,7 @@ impl Typer {
         self.window.add_controller(focus);
     }
 
-    fn key(&self, key: gdk::Key, state: gdk::ModifierType, pressed: bool) -> glib::Propagation {
+    fn key(&self, key: gdk::Key, code: u32, state: gdk::ModifierType, pressed: bool) -> glib::Propagation {
         if !matches!(*self.phase.borrow(), Phase::Typing) {
             return glib::Propagation::Proceed;
         }
@@ -227,10 +339,25 @@ impl Typer {
             shift: state.contains(gdk::ModifierType::SHIFT_MASK),
             sup: state.intersects(gdk::ModifierType::SUPER_MASK | gdk::ModifierType::META_MASK),
         };
-        match map_key(key.into_glib(), key.to_unicode(), mods, pressed) {
-            KeyAction::Send(msgs) => self.send(msgs),
-            KeyAction::Paste => self.paste(),
-            KeyAction::Ignore => {}
+        let mut out = self.keys.borrow_mut().release_stale(code, mods);
+        let mut close = false;
+        if pressed {
+            if self.notice.replace(false) {
+                self.show(&Phase::Typing);
+            }
+            let action = self.keys.borrow_mut().press(code, key.into_glib(), key.to_unicode(), mods);
+            match action {
+                KeyAction::Send(msgs) => out.extend(msgs),
+                KeyAction::Paste => self.paste(),
+                KeyAction::Close => close = true,
+                KeyAction::Ignore => {}
+            }
+        } else {
+            out.extend(self.keys.borrow_mut().release(code));
+        }
+        self.send(out);
+        if close {
+            self.window.close();
         }
         // Everything is for the phone while typing, nothing triggers a shortcut here
         glib::Propagation::Stop
@@ -241,9 +368,12 @@ impl Typer {
         self.window.clipboard().read_text_async(gtk::gio::Cancellable::NONE, move |text| match text {
             Ok(Some(text)) => {
                 let (msgs, cut) = paste_messages(&text);
+                // The phone sees no Ctrl held while the text arrives
+                let msgs = t.keys.borrow().around_paste(msgs);
                 t.send(msgs);
                 if cut {
                     t.status.set_description(Some(t!("That was a lot: only the start was sent.")));
+                    t.notice.set(true);
                 }
             }
             Ok(None) => {}
@@ -251,39 +381,28 @@ impl Typer {
         });
     }
 
+    /// Queue `msgs` for the writer; a queue that stays full means the connection is lost.
     fn send(&self, msgs: Vec<ControlMsg>) {
         if msgs.is_empty() || !matches!(*self.phase.borrow(), Phase::Typing) {
             return;
         }
-        for msg in &msgs {
-            if let ControlMsg::Key { keysym, pressed, .. } = msg {
-                if *pressed {
-                    self.held.borrow_mut().insert(*keysym);
-                } else {
-                    self.held.borrow_mut().remove(keysym);
-                }
-            }
-        }
-        let failed = {
-            let mut stream = self.stream.borrow_mut();
-            let Some(out) = stream.as_mut() else { return };
-            msgs.iter().any(|m| out.write_all(&control_frame(m)).is_err())
-        };
-        if failed {
-            self.lost();
+        let frames = msgs.iter().map(control_frame).collect();
+        let queued = self.writer.borrow().as_ref().map(|tx| tx.try_send(Job::Write(frames)).is_ok());
+        if queued == Some(false) {
+            self.write_failed();
         }
     }
 
+    /// Let go of every key the phone holds (focus left).
     fn release_held(&self) {
-        let held: Vec<u32> = self.held.borrow_mut().drain().collect();
-        if held.is_empty() {
+        let up = self.keys.borrow_mut().release_all();
+        if up.is_empty() {
             return;
         }
-        let mut stream = self.stream.borrow_mut();
-        if let Some(out) = stream.as_mut() {
-            for keysym in held {
-                let _ = out.write_all(&control_frame(&ControlMsg::Key { keysym, pressed: false, code: None }));
-            }
+        let frames = up.iter().map(control_frame).collect();
+        let queued = self.writer.borrow().as_ref().map(|tx| tx.try_send(Job::Release(frames)).is_ok());
+        if queued == Some(false) {
+            self.write_failed();
         }
     }
 }

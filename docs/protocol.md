@@ -2150,8 +2150,18 @@ phone is the receiver and hands them to its app. No new session kind and no new 
   at most 1024 bytes each (a paste is cut at 100 KiB); Enter, Backspace, arrows, F-keys and
   Shift/Ctrl/Alt (and shortcuts with Ctrl or Alt held) go as `key` presses and releases;
   Super, Meta, Caps/Num Lock and AltGr are not sent; keys still down are released when the
-  window loses focus or stops. A session that is declined, times out or ends within 2 s is
-  shown as "not supported" with the hint to turn Linksy Keyboard on in the phone's app.
+  window loses focus or stops. A key's release is always sent for the keysym its press sent
+  (tracked by physical key code), whatever modifiers are held by then; a modifier the phone
+  holds that a later key event shows is no longer down is released too (an input method may
+  swallow a modifier's release, e.g. Ctrl+Shift+U; unverified without a display). Pasted text
+  goes with held modifiers released around it, and restored after if still held. Alt+F4
+  closes the window and is not sent. A session that is declined, times out or ends within 2 s
+  is shown as "not supported" with the hint to turn Linksy Keyboard on in the phone's app; the
+  window sends from a thread of its own and shows "Lost connection" if a write fails, and
+  `linksy type` watches 2 s after the text for the phone ending the session, exits non-zero if
+  it did, and ends the session on every error path. Its stdin is limited to 100 KiB (an error
+  beyond that); the target is resolved like the service does (name, short id or fingerprint,
+  spaces ignored) before the `keyboard` check.
 
 ## 5. Core API the app would call (`linksy_core::Node`)
 
