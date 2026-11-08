@@ -401,10 +401,17 @@ impl Window {
     }
 
     pub(super) fn end_session(self: &Rc<Self>, session: Uuid) {
-        let Some(c) = self.client() else { return };
+        self.end_session_then(session, || {});
+    }
+
+    /// Like [`end_session`](Self::end_session), and `done` runs once the service has answered
+    /// (at once if there is no service to ask).
+    pub(super) fn end_session_then(self: &Rc<Self>, session: Uuid, done: impl FnOnce() + 'static) {
+        let Some(c) = self.client() else { return done() };
         let call = self.bridge.call(&c, move |c| async move { c.end_session(session).await });
         glib::spawn_future_local(async move {
             let _ = call.await;
+            done();
         });
     }
 }

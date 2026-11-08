@@ -25,8 +25,10 @@ use super::Window;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long in all letting go of held keys may take, from when it is asked for.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(2);
-/// How long a closing connection may take to send what is queued and let go of the keys
-/// before it is cut and the session ended anyway (the release deadline, and some room).
+/// How often a closing connection is checked for progress while it sends what is queued,
+/// lets go of the keys and waits for the service to say it passed it on. A check that finds
+/// none cuts it and ends the session anyway; one that finds some waits another period, a few
+/// times at most (`linksy_ipc::shutdown::MAX_EXTENSIONS`).
 const CLOSE_FALLBACK: Duration = Duration::from_secs(3);
 /// What may wait to be written (a paste is one job); a phone slower than this is lost.
 const QUEUE: usize = 64;
@@ -66,8 +68,12 @@ pub(super) struct Typer {
     writer: Rc<RefCell<Option<SyncSender<Job>>>>,
     /// What the writer sends last (the keys to let go of), set even when the queue is full.
     parting: Rc<RefCell<Option<Parting>>>,
-    /// Where the ordered shutdown is: the session ends only after the writer has drained.
+    /// Where the ordered shutdown is: the session ends only after the writer has drained and
+    /// the service has closed its side.
     closing: Rc<Cell<Closing>>,
+    /// Keeps the application alive while the shutdown runs, so closing the last window
+    /// doesn't end the program before the session is ended.
+    hold: Rc<RefCell<Option<gtk::gio::ApplicationHoldGuard>>>,
     session: Rc<Cell<Option<Uuid>>>,
     /// Keys the phone holds, so none stays down there.
     keys: Rc<RefCell<KeyTracker>>,
@@ -100,6 +106,7 @@ impl Typer {
             writer: Rc::default(),
             parting: Rc::default(),
             closing: Rc::new(Cell::new(Closing::Open)),
+            hold: Rc::default(),
             session: Rc::default(),
             keys: Rc::default(),
             notice: Rc::default(),
@@ -158,19 +165,36 @@ impl Typer {
         match stream.try_clone() {
             Ok(out) => {
                 let (tx, rx) = async_channel::bounded::<bool>(1);
-                let (jobs, parting) = spawn(out, QUEUE, WRITE_TIMEOUT, move |ok| {
-                    let _ = tx.send_blocking(ok);
-                });
+                // One pending note is enough: it only says the writer got somewhere
+                let (progress_tx, progress_rx) = async_channel::bounded::<()>(1);
+                let (jobs, parting) = spawn(
+                    out,
+                    QUEUE,
+                    WRITE_TIMEOUT,
+                    move || {
+                        let _ = progress_tx.try_send(());
+                    },
+                    move |ok| {
+                        let _ = tx.send_blocking(ok);
+                    },
+                );
                 *self.writer.borrow_mut() = Some(jobs);
                 *self.parting.borrow_mut() = Some(parting);
+                let t = self.clone();
+                glib::spawn_future_local(async move {
+                    while progress_rx.recv().await.is_ok() {
+                        t.closing_event(Event::Progress);
+                    }
+                });
                 let t = self.clone();
                 glib::spawn_future_local(async move {
                     if let Ok(ok) = rx.recv().await {
                         if !ok {
                             t.write_failed();
                         }
-                        // The writer is done, whichever way: the session can end now
-                        t.closing_event(Event::Drained);
+                        // Done sending: the session ends once the service has closed its side
+                        // too (or at once, if the writer failed)
+                        t.closing_event(Event::Drained { ok });
                     }
                 });
             }
@@ -189,6 +213,7 @@ impl Typer {
             glib::spawn_future_local(async move {
                 if rx.recv().await.is_ok() {
                     t.lost();
+                    t.closing_event(Event::ServiceClosed);
                 }
             });
         }
@@ -231,7 +256,11 @@ impl Typer {
     }
 
     fn closing_event(&self, event: Event) {
-        let (state, actions) = self.closing.get().next(event);
+        let before = self.closing.get();
+        if before == Closing::Open && matches!(event, Event::Begin { .. }) {
+            self.hold_application();
+        }
+        let (state, actions) = before.next(event);
         self.closing.set(state);
         for action in actions {
             match action {
@@ -244,6 +273,7 @@ impl Typer {
                 }
                 // Dropping the queue's sender: the writer still sends everything in it
                 Action::CloseQueue => drop(self.writer.borrow_mut().take()),
+                // A tick that finds progress arms the next one
                 Action::ArmTimeout => {
                     let t = self.clone();
                     glib::spawn_future_local(async move {
@@ -262,9 +292,18 @@ impl Typer {
         }
     }
 
+    /// Keep the program running until the shutdown is over (see [`Typer::hold`]).
+    fn hold_application(&self) {
+        let app = self.owner.upgrade().and_then(|o| o.window.application());
+        *self.hold.borrow_mut() = app.map(|app| gtk::gio::prelude::ApplicationExtManual::hold(&app));
+    }
+
+    /// Ends the session, and lets the program go once the service has answered.
     fn release_session(&self) {
-        if let (Some(owner), Some(session)) = (self.owner.upgrade(), self.session.take()) {
-            owner.end_session(session);
+        let hold = self.hold.take();
+        match (self.owner.upgrade(), self.session.take()) {
+            (Some(owner), Some(session)) => owner.end_session_then(session, move || drop(hold)),
+            _ => drop(hold),
         }
     }
 
