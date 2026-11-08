@@ -18,8 +18,23 @@ impl DeadlineWrite for UnixStream {
 }
 
 /// All of `buf`, or `TimedOut` once `deadline` has passed.
-pub fn write_all_by<W: DeadlineWrite>(w: &mut W, buf: &[u8], _deadline: Instant) -> io::Result<()> {
-    w.write_all(buf)
+pub fn write_all_by<W: DeadlineWrite>(w: &mut W, mut buf: &[u8], deadline: Instant) -> io::Result<()> {
+    while !buf.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out"));
+        }
+        w.set_timeout(Some(left))?;
+        match w.write(buf) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // what a socket's write timeout reports
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(io::Error::new(io::ErrorKind::TimedOut, "write timed out")),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

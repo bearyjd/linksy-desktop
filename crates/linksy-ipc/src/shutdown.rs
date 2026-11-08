@@ -37,8 +37,13 @@ pub enum Action {
 }
 
 impl Shutdown {
-    pub fn next(self, _event: Event) -> (Shutdown, Vec<Action>) {
-        (self, Vec::new())
+    pub fn next(self, event: Event) -> (Shutdown, Vec<Action>) {
+        match (self, event) {
+            (Shutdown::Open, Event::Begin { writer_alive: true }) => (Shutdown::Draining, vec![Action::QueueRelease, Action::CloseQueue, Action::ArmTimeout]),
+            (Shutdown::Open, Event::Begin { writer_alive: false }) | (Shutdown::Draining, Event::TimedOut) => (Shutdown::Done, vec![Action::ShutSocket, Action::EndSession]),
+            (Shutdown::Draining, Event::Drained) => (Shutdown::Done, vec![Action::EndSession]),
+            (state, _) => (state, Vec::new()),
+        }
     }
 }
 

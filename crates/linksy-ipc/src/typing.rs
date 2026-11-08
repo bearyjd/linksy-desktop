@@ -208,22 +208,61 @@ fn key_up(keysym: u32) -> ControlMsg {
 }
 
 fn is_modifier(keysym: u32) -> bool {
-    SHIFTS.iter().chain(&CONTROLS).chain(&ALTS).any(|k| *k == keysym)
+    modifier_class(keysym).is_some()
+}
+
+/// Shift, Ctrl and Alt are 0, 1 and 2; either side of the keyboard is the same class.
+fn modifier_class(keysym: u32) -> Option<u8> {
+    [&SHIFTS, &CONTROLS, &ALTS].iter().position(|keys| keys.contains(&keysym)).map(|i| i as u8)
+}
+
+/// Marks a tracked press the phone was sent on behalf of another key, not a key of its own.
+const SYNTHETIC: u32 = 1 << 31;
+
+fn is_synthetic(code: u32) -> bool {
+    code & SYNTHETIC != 0
 }
 
 impl KeyTracker {
-    /// A key went down: what to send, remembering which keys the phone now holds.
+    /// A key went down: what to send, remembering which keys the phone now holds. A key
+    /// that repeats under a different keysym (Shift joined while it was held) lets go of the
+    /// first one before the new one goes down, so nothing is stranded. A key sent with a
+    /// modifier the phone hasn't been told about (it was held before the window had focus, or
+    /// before the session began) gets that modifier's press first.
     pub fn press(&mut self, code: u32, keysym: u32, ch: Option<char>, mods: Mods) -> KeyAction {
         let action = map_key(keysym, ch, mods, true);
-        if let KeyAction::Send(msgs) = &action {
-            for msg in msgs {
-                if let ControlMsg::Key { keysym, pressed: true, .. } = msg {
-                    self.down.retain(|(c, _)| *c != code);
-                    self.down.push((code, *keysym));
+        let KeyAction::Send(msgs) = action else { return action };
+        let mut out = Vec::with_capacity(msgs.len());
+        for msg in msgs {
+            if let ControlMsg::Key { keysym, pressed: true, .. } = &msg {
+                if let Some(i) = self.down.iter().position(|(c, _)| *c == code) {
+                    let old = self.down.remove(i).1;
+                    if old != *keysym {
+                        out.push(key_up(old));
+                    }
                 }
+                match modifier_class(*keysym) {
+                    // the key itself takes over from one sent on its behalf
+                    Some(class) => self.down.retain(|(c, k)| !(is_synthetic(*c) && modifier_class(*k) == Some(class))),
+                    None => out.extend(self.missing_modifiers(mods)),
+                }
+                self.down.push((code, *keysym));
+            }
+            out.push(msg);
+        }
+        KeyAction::Send(out)
+    }
+
+    /// Presses for the modifiers in `mods` the phone holds none of, remembered as held.
+    fn missing_modifiers(&mut self, mods: Mods) -> Vec<ControlMsg> {
+        let mut out = Vec::new();
+        for (held, class, keysym) in [(mods.ctrl, 1u32, CONTROLS[0]), (mods.alt, 2, ALTS[0]), (mods.shift, 0, SHIFTS[0])] {
+            if held && !self.down.iter().any(|(_, k)| modifier_class(*k) == Some(class as u8)) {
+                self.down.push((SYNTHETIC | class, keysym));
+                out.push(ControlMsg::Key { keysym, pressed: true, code: None });
             }
         }
-        action
+        out
     }
 
     /// A key came up: let go of what its press sent, if anything, however the modifiers are now.
@@ -247,8 +286,13 @@ impl KeyTracker {
 
         /// A key came up and its keysym is `keysym`: like [`release`](Self::release), and a
     /// modifier sent on its behalf (it was held before the window saw it) goes up too.
-    pub fn release_event(&mut self, code: u32, _keysym: u32) -> Vec<ControlMsg> {
-        self.release(code)
+    pub fn release_event(&mut self, code: u32, keysym: u32) -> Vec<ControlMsg> {
+        let up = self.release(code);
+        let Some(class) = modifier_class(keysym).filter(|_| up.is_empty()) else { return up };
+        let (gone, kept): (Vec<_>, Vec<_>) = self.down.iter().partition(|(c, k)| is_synthetic(*c) && modifier_class(*k) == Some(class));
+        let up = gone.iter().map(|(_, k)| key_up(*k)).collect();
+        self.down = kept;
+        up
     }
 
     /// Everything the phone holds, let go (focus left, the session ends).
@@ -307,20 +351,13 @@ pub enum Closed {
     AfterWriting,
 }
 
-/// Whether a run is a failure given when the phone closed the session.
-pub fn delivery_outcome(_closed: Closed) -> Result<(), Problem> {
-    Ok(())
-}
-
-/// How a `linksy type` run went, given when the phone ended the session if it did (within the
-/// time it watched): ending at once means it never took it, the same as in the window.
-pub fn session_outcome(ended_after: Option<Duration>) -> Result<(), Problem> {
-    match ended_after {
-        Some(after) => match Phase::Typing.next(Step::Lost { after }) {
-            Phase::Failed(problem) => Err(problem),
-            _ => Ok(()),
-        },
-        None => Ok(()),
+/// Whether a run is a failure given when the phone closed the session: closing before the
+/// text was written means it never took it (the same as in the window); closing after is not
+/// a failure, or people retype what was already typed.
+pub fn delivery_outcome(closed: Closed) -> Result<(), Problem> {
+    match closed {
+        Closed::WhileWriting => Err(Problem::EndedAtOnce),
+        Closed::NotYet | Closed::AfterWriting => Ok(()),
     }
 }
 
