@@ -2153,15 +2153,30 @@ phone is the receiver and hands them to its app. No new session kind and no new 
   window loses focus or stops. A key's release is always sent for the keysym its press sent
   (tracked by physical key code), whatever modifiers are held by then; a modifier the phone
   holds that a later key event shows is no longer down is released too (an input method may
-  swallow a modifier's release, e.g. Ctrl+Shift+U; unverified without a display). Pasted text
+  swallow a modifier's release, e.g. Ctrl+Shift+U; unverified without a display); a Ctrl,
+  Alt or Shift held before the window saw it go down (focus came back, or the session began
+  with it held) is sent as a press before the key it modifies, and let go like any other. A
+  held key that repeats under another keysym (Shift joined) is released under the first
+  before the new one goes down. Pasted text
   goes with held modifiers released around it, and restored after if still held. Alt+F4
   closes the window and is not sent. A session that is declined, times out or ends within 2 s
   is shown as "not supported" with the hint to turn Linksy Keyboard on in the phone's app; the
-  window sends from a thread of its own and shows "Lost connection" if a write fails, and
-  `linksy type` watches 2 s after the text for the phone ending the session, exits non-zero if
-  it did, and ends the session on every error path. Its stdin is limited to 100 KiB (an error
+  window sends from a thread of its own and shows "Lost connection" if a write fails. Stop
+  (or closing the window) is ordered: what was typed is sent, held keys are released (within
+  2 s of the stop), the connection closes, and only then is the session ended, because the
+  service stops relaying the moment it ends; a writer that has not finished after 3 s is cut
+  off and the session ended anyway. `linksy type` writes everything (each write bounded),
+  then watches 2 s for the phone ending the session: ending it before the text was written
+  is "not supported"; ending it after is not a failure (the phone took the text). It then
+  closes its end and waits for the service to close its own, which means everything was
+  passed on; if that does not happen the command exits non-zero ("may not have got all of
+  it"). It ends the session on every error path. Its stdin is limited to 100 KiB (an error
   beyond that); the target is resolved like the service does (name, short id or fingerprint,
   spaces ignored) before the `keyboard` check.
+  Limit: a paste is not paced. The phone queues 256 frames and drops what is beyond that
+  (releases are kept), so several large pastes in quick succession, or one to a phone that is
+  busy, can lose text, or lose the press that restores a modifier after a paste; the
+  desktop cannot tell, because the phone sends no acknowledgement. Paste in pieces.
 
 ## 5. Core API the app would call (`linksy_core::Node`)
 
