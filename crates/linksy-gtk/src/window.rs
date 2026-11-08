@@ -20,6 +20,7 @@ mod password;
 mod prefs;
 mod screen;
 mod setup;
+mod typing;
 mod usb;
 
 use std::cell::RefCell;
@@ -612,6 +613,7 @@ impl Window {
                 page::Action::AllowScreen(on) => w.allow_screen(id, on),
                 page::Action::Locate => w.locate(id),
                 page::Action::Snap => w.snap(id),
+                page::Action::TypeOnPhone => w.type_on_phone(id),
                 page::Action::Controls(change) => w.change_controls(id, change),
                 page::Action::DndSync(on) => w.keep_dnd_in_sync(id, on),
                 page::Action::ForwardNotifications(on) => w.forward_notifications(id, on),

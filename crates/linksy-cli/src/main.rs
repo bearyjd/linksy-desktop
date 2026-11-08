@@ -24,6 +24,8 @@ Usage:
   linksy send <device> <files…>      send files or folders
   linksy notify <device> <title> [body]
   linksy clip <device> [text]        share text to its clipboard (default: stdin)
+  linksy type <phone> [text]         type into the phone's focused field (default: stdin, a
+                                     final newline is Enter); needs Linksy Keyboard on the phone
   linksy open <device> <url>         open a web link in its browser
   linksy ring <device> [--stop]      make it ring so you can find it
   linksy locate <phone>              ask a phone where it is (it can say no)
@@ -421,6 +423,46 @@ async fn run(c: &Client, cmd: &str, rest: &[String]) -> Result<(), String> {
             };
             c.send_clipboard(to.clone(), text).await.map_err(err)?;
             println!("Shared clipboard with {to}.");
+        }
+        ("type", [to, text @ ..]) => {
+            use linksy_ipc::typing::{Problem, paste_messages, phone_takes_typing, start_problem};
+            let text = if text.is_empty() {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(|e| e.to_string())?;
+                buf
+            } else {
+                text.join(" ")
+            };
+            let (messages, cut) = paste_messages(&text);
+            if messages.is_empty() {
+                return Err("Nothing to type.".into());
+            }
+            let not_enabled = format!("{to} didn't take it. On {to}, open Linksy and turn on Linksy Keyboard, then try again and tap Allow. Older versions of the Linksy app can't take typing.");
+            // Only phones that say they take typing are asked
+            let known = c.devices().await.map_err(err)?;
+            let named = |d: &&linksy_ipc::linksy_core::DeviceView| d.device.name.eq_ignore_ascii_case(to) || d.device.id.short().eq_ignore_ascii_case(to);
+            if known.iter().filter(named).any(|d| !phone_takes_typing(&d.device)) {
+                return Err(not_enabled);
+            }
+            println!("Asking {to}: tap Allow on it…");
+            let info = match c.start_session(to.clone(), linksy_ipc::linksy_core::SessionKind::Input).await {
+                Ok(info) => info,
+                Err(e) => {
+                    return Err(match start_problem(&e.to_string()) {
+                        Problem::Unsupported => format!("{to} can't take typing yet. Update Linksy on it."),
+                        Problem::NotAllowed | Problem::NoAnswer | Problem::EndedAtOnce => not_enabled,
+                        Problem::Other(e) => e,
+                    });
+                }
+            };
+            let socket = info.socket.ok_or("no stream to type into")?;
+            let mut stream = tokio::net::UnixStream::connect(&socket).await.map_err(|e| e.to_string())?;
+            for m in &messages {
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &linksy_ipc::linksy_core::protocol::control_frame(m)).await.map_err(|e| format!("{to} stopped taking typing: {e}"))?;
+            }
+            // Closing the stream ends the session once everything is on its way
+            tokio::io::AsyncWriteExt::shutdown(&mut stream).await.map_err(|e| e.to_string())?;
+            println!("Typed on {to}.{}", if cut { " That was a lot: only the start was sent." } else { "" });
         }
         ("invite", []) => {
             let uri = c.create_invite().await.map_err(err)?;

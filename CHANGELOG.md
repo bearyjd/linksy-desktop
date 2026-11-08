@@ -10,7 +10,13 @@ Linksy for Linux. Each version's section becomes its release notes.
   app, within fixed limits (frame size, text length, queue, held keys). Without the
   feature the phone declines. It always asks the phone's user, ends as soon as typing is
   turned off (also when turned off and on again: a session started before the
-  turn-off ends), and never waits on the app to read. Nothing uses it yet.
+  turn-off ends), and never waits on the app to read.
+- **Type on Phone** (GTK app and `linksy type <phone>`): on a phone that announces
+  `keyboard`, a small "Typing on <phone>" window sends what you type (and paste, and
+  input-method text) to the field the phone has focused; `linksy type` reads stdin. The
+  phone always asks. A phone that declines, doesn't answer or closes at once is told
+  apart from "typing is off" only by the hint to turn Linksy Keyboard on in its app.
+  Not tried on a phone. The Qt app doesn't offer it yet.
 
 ## 0.13.1
 

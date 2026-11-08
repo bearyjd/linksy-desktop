@@ -17,22 +17,47 @@ pub const INSTANT_END: Duration = Duration::from_secs(2);
 /// Whether to offer "Type on Phone" for `device`: a phone or tablet that announces `keyboard`.
 /// Unlike other features, an empty list never counts: older phones say nothing.
 pub fn phone_takes_typing(device: &DeviceInfo) -> bool {
-    let _ = (device, KEYBOARD_FEATURE, DeviceKind::Phone);
-    todo!()
+    matches!(device.kind, DeviceKind::Phone | DeviceKind::Tablet) && device.features.iter().any(|f| f == KEYBOARD_FEATURE)
 }
 
 /// `text` as `text` messages of at most [`MAX_KEYBOARD_TEXT`] bytes each, split between
 /// characters. Line ends become `\n`; other control characters except tab are dropped (the
 /// phone would anyway). Nothing for empty text.
 pub fn text_messages(text: &str) -> Vec<ControlMsg> {
-    let _ = text;
-    todo!()
+    let mut clean = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                clean.push('\n');
+            }
+            '\n' | '\t' => clean.push(c),
+            c if c.is_control() => {}
+            c => clean.push(c),
+        }
+    }
+    let mut out = Vec::new();
+    let mut rest = clean.as_str();
+    while !rest.is_empty() {
+        let mut end = rest.len().min(MAX_KEYBOARD_TEXT);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (head, tail) = rest.split_at(end);
+        out.push(ControlMsg::Text { text: head.to_string() });
+        rest = tail;
+    }
+    out
 }
 
 /// A paste: [`text_messages`] of the first [`MAX_PASTE`] bytes, and whether some was left out.
 pub fn paste_messages(text: &str) -> (Vec<ControlMsg>, bool) {
-    let _ = text;
-    todo!()
+    let mut end = text.len().min(MAX_PASTE);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text_messages(&text[..end]), end < text.len())
 }
 
 /// Modifier keys held while a key goes down.
@@ -57,8 +82,40 @@ pub enum KeyAction {
 /// any. Text is sent on the press only; the input method (compose, IME) delivers its own
 /// text, which doesn't come through here.
 pub fn map_key(keysym: u32, ch: Option<char>, mods: Mods, pressed: bool) -> KeyAction {
-    let _ = (keysym, ch, mods, pressed);
-    todo!()
+    const SHIFT_L: u32 = 0xffe1;
+    const SHIFT_R: u32 = 0xffe2;
+    const CONTROL_L: u32 = 0xffe3;
+    const CONTROL_R: u32 = 0xffe4;
+    const ALT_L: u32 = 0xffe9;
+    const ALT_R: u32 = 0xffea;
+    const TAB: u32 = 0xff09;
+    const ISO_LEFT_TAB: u32 = 0xfe20;
+    const INSERT: u32 = 0xff63;
+    let key = |keysym| KeyAction::Send(vec![ControlMsg::Key { keysym, pressed, code: None }]);
+    if mods.sup {
+        return KeyAction::Ignore;
+    }
+    match keysym {
+        SHIFT_L | SHIFT_R | CONTROL_L | CONTROL_R | ALT_L | ALT_R => return key(keysym),
+        // Caps/Num Lock, Meta, Super, Hyper, mode switch, AltGr: not sent
+        0xff7e | 0xff7f | 0xffe5..=0xffee | 0xfe03 => return KeyAction::Ignore,
+        ISO_LEFT_TAB => return key(TAB),
+        _ => {}
+    }
+    let paste = (mods.ctrl && !mods.alt && matches!(keysym, 0x76 | 0x56)) || (mods.shift && !mods.ctrl && !mods.alt && keysym == INSERT);
+    if paste {
+        return if pressed { KeyAction::Paste } else { KeyAction::Ignore };
+    }
+    if mods.ctrl || mods.alt {
+        return key(keysym);
+    }
+    match ch {
+        Some(c) if !c.is_control() => {
+            if pressed { KeyAction::Send(vec![ControlMsg::Text { text: c.to_string() }]) } else { KeyAction::Ignore }
+        }
+        _ if (0xff00..=0xffff).contains(&keysym) => key(keysym),
+        _ => KeyAction::Ignore,
+    }
 }
 
 /// Why typing on a phone didn't work, for the person.
@@ -77,8 +134,15 @@ pub enum Problem {
 
 /// What the service said when it couldn't start the session.
 pub fn start_problem(error: &str) -> Problem {
-    let _ = error;
-    todo!()
+    if error.contains("can't do this yet") {
+        Problem::Unsupported
+    } else if error.contains("declined") {
+        Problem::NotAllowed
+    } else if error.contains("timed out") {
+        Problem::NoAnswer
+    } else {
+        Problem::Other(error.to_string())
+    }
 }
 
 /// Where a typing session is.
@@ -102,8 +166,14 @@ pub enum Step {
 
 impl Phase {
     pub fn next(self, step: Step) -> Phase {
-        let _ = step;
-        todo!()
+        match (self, step) {
+            (Phase::Asking, Step::Started) => Phase::Typing,
+            (Phase::Asking, Step::StartFailed(error)) => Phase::Failed(start_problem(&error)),
+            (Phase::Asking | Phase::Typing, Step::StopPressed) => Phase::Stopped { by_phone: false },
+            (Phase::Asking | Phase::Typing, Step::Lost { after }) if after < INSTANT_END => Phase::Failed(Problem::EndedAtOnce),
+            (Phase::Typing, Step::Lost { .. }) => Phase::Stopped { by_phone: true },
+            (phase, _) => phase,
+        }
     }
 }
 

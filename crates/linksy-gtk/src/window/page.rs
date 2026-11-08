@@ -55,6 +55,8 @@ pub enum Action {
     Locate,
     /// Ask a phone to open its camera and send the picture.
     Snap,
+    /// Type on the phone's focused field from this computer's keyboard.
+    TypeOnPhone,
     /// Change some of the phone's controls, or keep its Do Not Disturb in step with this computer's.
     Controls(ControlsChange),
     DndSync(bool),
@@ -141,6 +143,7 @@ pub struct DevicePage {
     ring_tile: gtk::Widget,
     locate_tile: gtk::Widget,
     snap_tile: gtk::Widget,
+    type_tile: gtk::Widget,
     ping_tile: gtk::Widget,
     /// "Use the phone as": a card per feature, two by two.
     use_as: gtk::Box,
@@ -369,6 +372,7 @@ impl DevicePage {
         let ring_tile = tile("audio-volume-high-symbolic", t!("Ring"), t!("Loud, even on silent"), true, || Action::Ring);
         let locate_tile = tile("find-location-symbolic", t!("Locate"), t!("Asked once, never tracked"), true, || Action::Locate);
         let snap_tile = tile("camera-photo-symbolic", t!("Snap from Phone"), t!("Take a picture, get it here"), false, || Action::Snap);
+        let type_tile = tile("input-keyboard-symbolic", t!("Type on Phone"), t!("Use this keyboard on it"), false, || Action::TypeOnPhone);
         let ping_tile = tile("preferences-system-notifications-symbolic", t!("Ping"), t!("Show a notification"), false, || Action::Ping);
         // Not expanding: their insides push text to the bottom, not the page.
         let actions = gtk::Box::builder().spacing(10).homogeneous(true).vexpand(false).build();
@@ -880,6 +884,7 @@ impl DevicePage {
             ring_tile,
             locate_tile,
             snap_tile,
+            type_tile,
             ping_tile,
             use_as,
             use_as_title,
@@ -1225,6 +1230,7 @@ impl DevicePage {
         self.ring_tile.set_visible(ring);
         self.locate_tile.set_visible(d.device.kind == DeviceKind::Phone && super::can(&d.device, "locate"));
         self.snap_tile.set_visible(d.trusted && super::can(&d.device, "snap"));
+        self.type_tile.set_visible(d.trusted && linksy_ipc::typing::phone_takes_typing(&d.device));
         self.ping_tile.set_visible(!ring);
 
         self.display_card.set_visible(super::can(&d.device, "display"));

@@ -2144,6 +2144,14 @@ phone is the receiver and hands them to its app. No new session kind and no new 
   `KeyboardInput::next().await -> Option<KeyInput>` (`KeyInput::Text(String)` or
   `KeyInput::Key { keysym, pressed }`; its `Debug` shows a text's length only). Add
   `"keyboard"` to `Config.features` or `Node::set_features` when the app can type.
+- **The desktop as requester** (`linksy_ipc::typing`, the GTK "Type on Phone" window,
+  `linksy type`): offered only for a phone or tablet that announces `keyboard` (an empty
+  feature list is not enough). Printable keys, input-method text and paste go as `text`,
+  at most 1024 bytes each (a paste is cut at 100 KiB); Enter, Backspace, arrows, F-keys and
+  Shift/Ctrl/Alt (and shortcuts with Ctrl or Alt held) go as `key` presses and releases;
+  Super, Meta, Caps/Num Lock and AltGr are not sent; keys still down are released when the
+  window loses focus or stops. A session that is declined, times out or ends within 2 s is
+  shown as "not supported" with the hint to turn Linksy Keyboard on in the phone's app.
 
 ## 5. Core API the app would call (`linksy_core::Node`)
 
