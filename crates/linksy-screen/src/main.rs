@@ -36,6 +36,7 @@
 mod mutter;
 mod outputs;
 mod portal;
+mod virtual_mic;
 mod wlr;
 mod x11;
 
@@ -43,6 +44,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -134,6 +136,9 @@ fn main() -> ExitCode {
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
     }
+    if std::env::args().nth(1).as_deref() == Some("check") {
+        return check();
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -145,9 +150,83 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("linksy-screen: {e}");
-            ExitCode::FAILURE
+            if MISSING.load(Ordering::Relaxed) { ExitCode::from(MISSING_PIECE) } else { ExitCode::FAILURE }
         }
     }
+}
+
+/// The exit code for "GStreamer lacks something here": the service tells the person, who
+/// would otherwise only see the session close (desktop#85).
+const MISSING_PIECE: u8 = 3;
+static MISSING: AtomicBool = AtomicBool::new(false);
+
+/// An error that is a missing piece of GStreamer.
+fn missing(what: impl Into<String>) -> String {
+    MISSING.store(true, Ordering::Relaxed);
+    what.into()
+}
+
+/// `linksy-screen check`: what each feature lacks here, then the real thing on a test
+/// picture and a test tone, so "it doesn't work" comes with why. Exits 3 if a piece is missing.
+fn check() -> ExitCode {
+    use linksy_setup::pieces::Feature;
+    if let Err(e) = gst::init() {
+        println!("GStreamer doesn't start: {e}");
+        return ExitCode::from(MISSING_PIECE);
+    }
+    let has = |element: &str| gst::ElementFactory::find(element).is_some();
+    let mut ready = true;
+    for feature in Feature::ALL {
+        let lacking = feature.lacking(has);
+        if lacking.is_empty() {
+            println!("{}: ready", feature.name());
+        }
+        for piece in lacking {
+            ready = false;
+            println!("{}: GStreamer has no {} here", feature.name(), piece.elements.join(" or "));
+        }
+    }
+    match (camera_device(), has("v4l2sink"), has("pipewiresink")) {
+        (Some(_), true, _) => println!("phone camera: shown to every app (the Linksy Camera device)"),
+        (Some(_), false, true) => println!("phone camera: PipeWire apps only, GStreamer has no v4l2sink here (browsers and Zoom need it)"),
+        (None, _, true) => println!("phone camera: PipeWire apps only, there is no Linksy Camera device (Finish Setup makes it)"),
+        (_, _, false) => {}
+    }
+    // The picture a phone sends, made and read back here
+    let decoder = ["avdec_h264", "vah264dec", "openh264dec"].into_iter().find(|d| gst::ElementFactory::make(d).build().is_ok());
+    let video = decoder.and_then(|decoder| {
+        encoders(4000).into_iter().find_map(|(encoder, format)| {
+            let name = encoder.split_whitespace().next().unwrap_or_default().to_string();
+            let trial = format!(
+                "videotestsrc num-buffers=30 ! video/x-raw,width=640,height=480,framerate=30/1 ! videoconvert ! video/x-raw,format={format} \
+                 ! {encoder} ! video/x-h264,profile=constrained-baseline ! h264parse ! {} ! videoconvert ! fakesink",
+                low_latency(decoder)
+            );
+            match play(&trial) {
+                Ok(()) => Some(format!("{name} and {decoder}")),
+                Err(e) => {
+                    println!("video: {name} doesn't work here ({e})");
+                    None
+                }
+            }
+        })
+    });
+    match video {
+        Some(with) => println!("video: a test picture was encoded and decoded ({with})"),
+        None => {
+            ready = false;
+            println!("video: no H.264 encoder and decoder work together here");
+        }
+    }
+    let tone = format!("audiotestsrc num-buffers=50 ! audioconvert ! audioresample ! {MIC_CAPS} ! {} ! audioconvert ! fakesink", mic_gain());
+    match play(&tone) {
+        Ok(()) => println!("audio: a test tone went through"),
+        Err(e) => {
+            ready = false;
+            println!("audio: {e}");
+        }
+    }
+    if ready { ExitCode::SUCCESS } else { ExitCode::from(MISSING_PIECE) }
 }
 
 fn run(args: Args) -> Result<(), String> {
@@ -263,7 +342,7 @@ fn run(args: Args) -> Result<(), String> {
     let mut restarts = 0;
     let mut attempt = 0;
     let result = loop {
-        let Some(current) = attempts.get(attempt).cloned() else { break Err("no H.264 encoder here works (install openh264 or x264)".to_string()) };
+        let Some(current) = attempts.get(attempt).cloned() else { break Err(missing("no H.264 encoder here works (install openh264 or x264)")) };
         let (encoder, _, memory) = &current;
         let memory = *memory;
         let name = encoder.split_whitespace().next().unwrap_or("encoder").to_string();
@@ -613,6 +692,47 @@ pub fn camera_device() -> Option<PathBuf> {
     })
 }
 
+/// The step that gives the decoded stream a fixed frame rate, which a camera device needs.
+/// `capssetter` (gst-plugins-good's "debug" plugin) does it without touching the frames; some
+/// installs lack it and the session then ended at once (desktop#85), so `videorate`, from
+/// gst-plugins-base, does it there. With no timestamps to go by it passes every frame on.
+fn fixed_rate(fps: u32) -> String {
+    if gst::ElementFactory::find("capssetter").is_some() {
+        format!("capssetter caps=video/x-raw,framerate={fps}/1")
+    } else {
+        eprintln!("linksy-screen: no capssetter (gst-plugins-good's debug plugin); the camera's frame rate is set with videorate");
+        format!("videorate ! video/x-raw,framerate={fps}/1")
+    }
+}
+
+/// Where the camera's frames go. On the V4L2 device for browsers and Zoom, and to PipeWire
+/// too: the device only says it's a camera while something writes to it (what browsers
+/// need), and PipeWire looked at it before that, so PipeWire apps (OBS's camera source)
+/// would list it blank. An install that lacks one of the two elements keeps the other
+/// (desktop#85: no `v4l2sink` ended the camera at once).
+fn camera_sink(device: Option<&std::path::Path>, v4l2sink: bool, pipewiresink: bool, pipewire: &str) -> Result<String, String> {
+    let device = device.map(|d| format!("v4l2sink device={} sync=false", d.display()));
+    // PipeWire takes no frames while no app reads the camera: they are dropped here, or
+    // the phone's stream would back up behind them
+    let pipewire = format!("queue leaky=downstream max-size-buffers=2 ! {pipewire}");
+    match (device, v4l2sink, pipewiresink) {
+        (Some(device), true, true) => Ok(format!(
+            "tee name=cam ! queue leaky=downstream max-size-buffers=2 ! {device} cam. ! {pipewire}"
+        )),
+        (Some(device), true, false) => {
+            eprintln!("linksy-screen: no pipewiresink (PipeWire's GStreamer plugin); the camera is on the Linksy Camera device only");
+            Ok(device)
+        }
+        (Some(_), false, true) => {
+            eprintln!("linksy-screen: no v4l2sink (gst-plugins-good's video4linux2 plugin); the camera is offered to PipeWire apps only, not to browsers or Zoom");
+            Ok(format!("tee ! {pipewire}"))
+        }
+        (None, _, true) => Ok(format!("tee ! {pipewire}")),
+        (Some(_), false, false) => Err(missing("no v4l2sink and no pipewiresink: install gst-plugins-good and PipeWire's GStreamer plugin")),
+        (None, _, false) => Err(missing("no pipewiresink: install PipeWire's GStreamer plugin")),
+    }
+}
+
 /// The receiving end of a camera session: decode and offer it as a camera for as long as
 /// the stream lasts: on the Linksy Camera device when there is one, else to PipeWire apps.
 fn webcam(socket: &std::path::Path, name: &str, fps: u32) -> Result<(), String> {
@@ -620,7 +740,7 @@ fn webcam(socket: &std::path::Path, name: &str, fps: u32) -> Result<(), String> 
     let decoder = ["avdec_h264", "vah264dec", "openh264dec"]
         .into_iter()
         .find(|d| gst::ElementFactory::make(d).build().is_ok())
-        .ok_or("no H.264 decoder: install gstreamer1-plugin-openh264 or gstreamer1-plugin-libav")?;
+        .ok_or_else(|| missing("no H.264 decoder: install GStreamer's openh264 or libav plugin"))?;
     let decoder = low_latency(decoder);
     // Offered the way webcams are, YUY2 at a fixed rate (what the phone sends: 30 or 60):
     // apps like OBS list a camera's formats and rates from this, and skip what they can't
@@ -631,21 +751,13 @@ fn webcam(socket: &std::path::Path, name: &str, fps: u32) -> Result<(), String> 
         "pipewiresink mode=provide sync=false \
          stream-properties=\"props,media.class=Video/Source,media.role=Camera,node.name=linksy-camera,node.description=\\\"{name}\\\"\""
     );
-    // On the V4L2 device for browsers and Zoom, and to PipeWire too: the device only says
-    // it's a camera while something writes to it (what browsers need), and PipeWire looked
-    // at it before that, so PipeWire apps (OBS's camera source) would list it blank.
-    let sink = match camera_device() {
-        Some(dev) => format!(
-            "tee name=cam ! queue leaky=downstream max-size-buffers=2 ! v4l2sink device={} sync=false \
-             cam. ! queue leaky=downstream max-size-buffers=2 ! {pipewire}",
-            dev.display()
-        ),
-        None => pipewire,
-    };
+    let has = |element: &str| gst::ElementFactory::find(element).is_some();
+    let sink = camera_sink(camera_device().as_deref(), has("v4l2sink"), has("pipewiresink"), &pipewire)?;
     let description = format!(
         "fdsrc fd={} ! h264parse ! {decoder} ! videoconvert ! video/x-raw,format=YUY2 \
-         ! capssetter caps=video/x-raw,framerate={fps}/1 ! {sink}",
-        input.as_raw_fd()
+         ! {} ! {sink}",
+        input.as_raw_fd(),
+        fixed_rate(fps)
     );
     let result = play(&description);
     drop(input);
@@ -684,29 +796,74 @@ fn speaker(socket: &std::path::Path, test: bool) -> Result<(), String> {
     result
 }
 
+/// How much louder a phone's microphone is made here. A phone sends what its microphone
+/// hears, without the gain its own recorder adds: measured 13 dB under it (desktop#89).
+/// 12 dB brings a voice level with the recorder's; what would go over is held at full scale.
+const MIC_GAIN_DB: f64 = 12.0;
+
+fn mic_gain() -> String {
+    format!("volume volume={:.3}", 10f64.powf(MIC_GAIN_DB / 20.0))
+}
+
 fn microphone(socket: &std::path::Path, name: &str) -> Result<(), String> {
     let input = UnixStream::connect(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let name: String = name.chars().filter(|c| !matches!(c, '"' | '\\' | ',')).collect();
-    // Audio/Source, not Audio/Source/Virtual: PipeWire 1.6 crashes the stream with the latter.
+    // The service ends this with SIGTERM: the virtual microphone goes with it
+    stop_on_term();
+    // A virtual source that audio is played into. A node published with `mode=provide` stops
+    // delivering on PipeWire 1.6 (desktop#89); that stays the way when there is no pactl.
+    let (sink, _source) = match virtual_mic::VirtualMic::create(&name) {
+        Ok(source) => (virtual_mic::feed(), Some(source)),
+        Err(e) => {
+            eprintln!("linksy-screen: {e}; the microphone is published as a PipeWire node, which stops after a moment on PipeWire 1.6");
+            // Audio/Source, not Audio/Source/Virtual: PipeWire 1.6 crashes the stream with the latter.
+            let node = format!(
+                "pipewiresink mode=provide sync=false \
+                 stream-properties=\"props,media.class=Audio/Source,node.name=linksy-mic,node.description=\\\"{name}\\\"\""
+            );
+            (node, None)
+        }
+    };
     let description = format!(
         "fdsrc fd={} ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=48000 num-channels=1 \
-         ! queue max-size-time=100000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! audioconvert \
-         ! pipewiresink mode=provide sync=false \
-         stream-properties=\"props,media.class=Audio/Source,node.name=linksy-mic,node.description=\\\"{name}\\\"\"",
-        input.as_raw_fd()
+         ! queue max-size-time=100000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! {} ! audioconvert ! {sink}",
+        input.as_raw_fd(),
+        mic_gain()
     );
     let result = play(&description);
     drop(input);
     result
 }
 
+/// Set by SIGTERM, so a run can end the proper way and put back what it made.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+fn stop_on_term() {
+    // SAFETY: the handler only stores to an atomic
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
+}
+
 /// Run a pipeline until it ends or fails.
 fn play(description: &str) -> Result<(), String> {
-    let pipeline = gst::parse::launch(description).map_err(|e| format!("pipeline: {e}"))?;
+    let mut context = gst::ParseContext::new();
+    let pipeline = gst::parse::launch_full(description, Some(&mut context), gst::ParseFlags::empty()).map_err(|e| {
+        let lacking = context.missing_elements();
+        if lacking.is_empty() { format!("pipeline: {e}") } else { missing(format!("GStreamer has no {} here", lacking.join(", "))) }
+    })?;
     pipeline.set_state(gst::State::Playing).map_err(|e| format!("could not start: {e}"))?;
     let bus = pipeline.bus().ok_or("pipeline has no bus")?;
     let result = loop {
-        let Some(msg) = bus.timed_pop(gst::ClockTime::NONE) else { break Ok(()) };
+        if STOP.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        // Wakes up now and then to look at STOP
+        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) else { continue };
         match msg.view() {
             gst::MessageView::Eos(_) => break Ok(()),
             gst::MessageView::Error(e) => break Err(format!("{} ({:?})", e.error(), e.debug())),
@@ -719,7 +876,41 @@ fn play(description: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::falls_behind;
+    use super::{camera_sink, falls_behind, mic_gain};
+    use std::path::Path;
+
+    #[test]
+    fn a_camera_goes_to_the_device_and_to_pipewire() {
+        let sink = camera_sink(Some(Path::new("/dev/video9")), true, true, "pipewiresink").unwrap();
+        assert!(sink.starts_with("tee name=cam"));
+        assert!(sink.contains("v4l2sink device=/dev/video9"));
+        assert!(sink.ends_with("! pipewiresink"));
+    }
+
+    #[test]
+    fn a_camera_without_v4l2sink_is_still_offered_to_pipewire() {
+        let alone = "tee ! queue leaky=downstream max-size-buffers=2 ! pipewiresink";
+        assert_eq!(camera_sink(Some(Path::new("/dev/video9")), false, true, "pipewiresink").unwrap(), alone);
+        assert_eq!(camera_sink(None, false, true, "pipewiresink").unwrap(), alone);
+        assert_eq!(camera_sink(None, true, true, "pipewiresink").unwrap(), alone);
+    }
+
+    #[test]
+    fn a_camera_without_pipewiresink_is_still_on_the_device() {
+        assert_eq!(camera_sink(Some(Path::new("/dev/video9")), true, false, "pipewiresink").unwrap(), "v4l2sink device=/dev/video9 sync=false");
+    }
+
+    #[test]
+    fn a_camera_with_nowhere_to_go_says_what_to_install() {
+        assert!(camera_sink(Some(Path::new("/dev/video9")), false, false, "pipewiresink").unwrap_err().contains("gst-plugins-good"));
+        assert!(camera_sink(None, true, false, "pipewiresink").unwrap_err().contains("PipeWire"));
+    }
+
+
+    #[test]
+    fn a_phone_microphone_is_made_12_db_louder() {
+        assert_eq!(mic_gain(), "volume volume=3.981");
+    }
 
     #[test]
     fn an_encoder_that_keeps_up_stays_at_60() {

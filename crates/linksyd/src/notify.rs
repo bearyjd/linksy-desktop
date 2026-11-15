@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use linksy_core::{CallState, Direction, Event, Fingerprint, Node, SessionKind, Uuid};
 use linksy_i18n::t;
@@ -16,6 +17,9 @@ const APP: &str = "Linksy";
 pub(crate) const DESKTOP_ENTRY: &str = "mg.diary.linksy.Linksy";
 /// Battery level, in percent, at which a device's low battery is announced (once).
 const LOW_BATTERY: u8 = 15;
+/// A phone that leaves its touchpad page and comes back starts a new session each time: the
+/// notice that a session was allowed without asking is not repeated within this.
+const SAID_FOR: Duration = Duration::from_secs(60);
 
 /// What a prompt's "always" button allows a device from now on.
 #[derive(Clone, Copy)]
@@ -68,6 +72,8 @@ pub async fn run(node: Node) {
     let mut warned: std::collections::HashSet<Fingerprint> = Default::default();
     // Session requests asked about: one that starts without being asked is said.
     let mut asked: std::collections::HashSet<Uuid> = Default::default();
+    // When a device's allowed-without-asking session was last said
+    let mut said: HashMap<(Fingerprint, String), Instant> = Default::default();
     loop {
         let event = match events.recv().await {
             Ok(e) => e,
@@ -150,7 +156,9 @@ pub async fn run(node: Node) {
                         SessionKind::Input => t!("{name} is your touchpad and keyboard", name = peer.name),
                         _ => t!("{name} is watching your screen", name = peer.name),
                     };
-                    show(summary, t!("Allowed without asking, as you chose. Stop it in Linksy, or turn it off on {device}'s page.", device = peer.name));
+                    if !already_said(&mut said, (peer.id, summary.clone()), Instant::now()) {
+                        show(summary, t!("Allowed without asking, as you chose. Stop it in Linksy, or turn it off on {device}'s page.", device = peer.name));
+                    }
                 }
             }
             Event::SessionEnded { session } => {
@@ -163,8 +171,7 @@ pub async fn run(node: Node) {
                 show(t!("Paired with {device}", device = device.name), t!("You can now share files and more.").into());
             }
             Event::Notification { from, title, body } => {
-                let from = t!("From {device}", device = from.name);
-                let body = if body.is_empty() { from } else { format!("{body}\n{from}") };
+                let body = with_sender(&body, &from.name, t!("From {device}", device = from.name));
                 show(title, body);
             }
             Event::Battery { from, battery } if battery.level <= LOW_BATTERY && !battery.charging => {
@@ -202,6 +209,28 @@ pub async fn run(node: Node) {
     }
 }
 
+/// Whether this notice was already shown within `SAID_FOR`; notes it when it wasn't.
+fn already_said(said: &mut HashMap<(Fingerprint, String), Instant>, notice: (Fingerprint, String), now: Instant) -> bool {
+    said.retain(|_, at| now.saturating_duration_since(*at) < SAID_FOR);
+    if said.contains_key(&notice) {
+        return true;
+    }
+    said.insert(notice, now);
+    false
+}
+
+/// A phone's notification with the device it came from added under the text, unless the
+/// text already says it (a Ping's does, which showed the line twice).
+fn with_sender(body: &str, device: &str, from: String) -> String {
+    if body.is_empty() {
+        from
+    } else if body.contains(device) {
+        body.to_string()
+    } else {
+        format!("{body}\n{from}")
+    }
+}
+
 pub fn base(summary: &str, body: &str) -> Notification {
     let mut n = Notification::new();
     n.appname(APP).summary(summary).body(body).icon(DESKTOP_ENTRY).hint(Hint::DesktopEntry(DESKTOP_ENTRY.into()));
@@ -212,6 +241,30 @@ pub(crate) fn show(summary: String, body: String) {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = base(&summary, &body).show() {
             debug!("notification failed: {e}");
+        }
+    });
+}
+
+/// A phone's saved deck uses actions that are off here (docs/protocol.md §4.26): which, and
+/// an Allow that turns them on for that phone. Nothing else decides it: the phone can't.
+pub(crate) fn deck_asks(phone: Fingerprint, device: String, actions: Vec<(String, String)>) {
+    tokio::task::spawn_blocking(move || {
+        let names = actions.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>().join(", ");
+        let mut n = base(&t!("{device}'s deck needs your OK", device = device), &t!("It uses {actions}, which are off on this computer. Allow them here, or choose in Linksy, on {device}'s page.", actions = names, device = device));
+        n.action("allow", t!("Allow"));
+        match n.show() {
+            Ok(handle) => handle.wait_for_action(|action| {
+                if action != "allow" {
+                    return;
+                }
+                let Some(deck) = crate::deck::DECK.get() else { return };
+                for (id, _) in &actions {
+                    if let Err(e) = deck.set_action(&phone, id, true) {
+                        debug!("could not allow {id}: {e}");
+                    }
+                }
+            }),
+            Err(e) => debug!("notification failed: {e}"),
         }
     });
 }
@@ -343,4 +396,34 @@ pub fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     if v < 10.0 { format!("{v:.1} {}", UNITS[unit]) } else { format!("{v:.0} {}", UNITS[unit]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_allowed_without_asking_is_said_once_a_minute() {
+        let (a, b) = (Fingerprint([1; 32]), Fingerprint([2; 32]));
+        let mut said = HashMap::new();
+        let start = Instant::now();
+        let touchpad = |who| (who, "Pixel is your touchpad and keyboard".to_string());
+        assert!(!already_said(&mut said, touchpad(a), start));
+        // The phone comes back a few seconds later
+        assert!(already_said(&mut said, touchpad(a), start + Duration::from_secs(5)));
+        // Another device, or another kind of session, is its own notice
+        assert!(!already_said(&mut said, touchpad(b), start + Duration::from_secs(6)));
+        assert!(!already_said(&mut said, (a, "Pixel is controlling your screen".into()), start + Duration::from_secs(7)));
+        // After a minute it is said again
+        assert!(!already_said(&mut said, touchpad(a), start + SAID_FOR + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_notification_names_its_phone_once() {
+        let from = || "From Pixel".to_string();
+        assert_eq!(with_sender("", "Pixel", from()), "From Pixel");
+        assert_eq!(with_sender("Lunch?", "Pixel", from()), "Lunch?\nFrom Pixel");
+        assert_eq!(with_sender("From Pixel", "Pixel", from()), "From Pixel");
+        assert_eq!(with_sender("Ping from Pixel", "Pixel", from()), "Ping from Pixel");
+    }
 }

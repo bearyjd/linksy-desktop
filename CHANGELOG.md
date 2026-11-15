@@ -24,9 +24,126 @@ Linksy for Linux. Each version's section becomes its release notes.
   with a time limit, waits 2 s after the text to see the phone kept the session, exits
   non-zero (with the hint to turn Linksy Keyboard on) if the phone ended the session within
   2 s of it starting, even when the text had been written, or if the service did not finish
-  passing it on, and its stdin is limited to 100 KiB. Very large pastes are not paced (see protocol §4.26).
+  passing it on, and its stdin is limited to 100 KiB. Very large pastes are not paced (see protocol §4.27).
   The new strings were translated by an AI and want a native review.
   Not tried on a phone. The Qt app doesn't offer it yet.
+
+## 0.16.0
+
+### Added
+- **A device's page says how it is reached away from home:** "direct" when the two talk
+  straight to each other, "through the relay" when they can't, which is the slower way. Both
+  apps.
+- **Something large through the relay is asked about first:** from 200 MB on, the apps say
+  how much it is and that it will take a while, with Send and Cancel.
+
+## 0.15.0
+
+### Added
+- **A welcome on the first run,** in both apps: what Linksy does, a QR code to the phone's
+  app, pairing right there (a phone that pairs moves it on), Finish Setup with its buttons,
+  and where things are. Five slides, skippable, shown once, and never to someone who already
+  used Linksy on the computer.
+- **`linksy doctor` checks the camera, microphone and screens:** what each lacks here, then a
+  test picture encoded and decoded and a test tone, for real (`linksy-screen check`). The
+  tarball's installer says the same at the end, since a tarball brings no dependencies.
+
+### Fixed
+- **The packages bring gst-plugins-bad:** `h264parse` comes from it, and neither the phone's
+  camera nor screen sharing runs without it. It was only recommended.
+- **Paired phones reconnect after a restart on GNOME.** The service also started for the
+  login screen, where it took Linksy's port, so yours got another one and phones no longer
+  recognised the computer. It now starts for people only (thanks, Lur1fa).
+- **Arch: `linksy-common` no longer needs a window package,** which made the two depend on
+  each other and could fail upgrades with yay (thanks, ichirou2910).
+
+### Changed
+- **Finish Setup has a Microphone and Sound line:** what plays the phone's sound and sends
+  this computer's microphone was never checked.
+- What each feature needs from GStreamer is now one table that Finish Setup, the check above
+  and a test share: an element a pipeline uses that nothing checks fails the build.
+
+## 0.14.1
+
+### Fixed
+- **The phone's camera no longer closes at once where GStreamer lacks `v4l2sink`** (an
+  install without gst-plugins-good, as from the tarball). It is then offered to PipeWire apps
+  only, and the log says so. The same the other way round: without PipeWire's plugin it stays
+  on the Linksy Camera device.
+- **A session that can't start for a missing piece says so.** A notification on the computer
+  tells that GStreamer lacks something and points to Finish Setup; before, the phone's screen
+  just closed and the reason was only in the log.
+- **Finish Setup checks what the camera needs:** `h264parse` (gst-plugins-bad) and `v4l2sink`
+  (gst-plugins-good) are looked for and installed with the rest. It said everything was ready
+  without them.
+- **The phone's microphone is 12 dB louder.** A phone sends what its microphone hears without
+  the gain its own recorder adds, so voices came in very quiet; they are now level with the
+  phone's recorder. Nothing to set, and it holds between sessions.
+- **The phone's camera doesn't hold the phone's stream back while no app reads it** (computers
+  without the Linksy Camera device): frames nobody takes are dropped, so an app that opens the
+  camera later gets the picture of that moment.
+
+## 0.14.0
+
+### Changed
+- **The deck is edited on the phone.** The computer's own deck editor is gone (it was in the
+  GTK app only). A phone's deck page on the computer is now what it may do here: a grid of
+  tiles, a switch each, by group, with Turn All On and Off for the ones that don't ask first;
+  what its saved deck asked for; and your own commands. Both apps have it, the same. Layouts
+  you made on the computer before stay, and show on the phone.
+- **The Qt app's device page matches the GTK app's:** Send Files is a big dashed tile (also
+  where files are dropped, and Ctrl+O now chooses them there too), with Clipboard, View
+  Screen, Ring and Locate as cards beside it, in the style of the other cards. The devices
+  column starts narrower, and the list's sides line up with the buttons under it.
+- **A phone can't turn on an action by putting a button for it on its deck.** Restart, Shut
+  Down, Airplane Mode and your commands stay off until you allow them on the computer. When a
+  saved deck uses one, the page lists it under "Asked for by" the phone, and a notification
+  offers Allow.
+
+### Added
+- **The computer keeps the deck the phone saves** (`deck_layout_save`, docs/protocol.md
+  §4.26): saved on the version the computer has, kept one version on and sent back; a stale
+  one is refused with the current layouts, a broken one with why. The phone side of saving is
+  in the next phone release.
+- **Your commands can have a group, an icon and a question first,** and be a switch: one
+  command to turn on, one to turn off (or the same flips it), and a check that succeeds while
+  it is on. The deck shows the switch's state, asked every 3 seconds while it is open.
+- **Try It Now** beside a command line: runs it once and shows the exit code and what it
+  printed.
+- Network, Power and Time group names are translated in the Qt app, like in the GTK app.
+
+### Fixed
+- **A device's page no longer shifts as you change tabs.** In the GTK app the page was
+  narrower on tabs with narrower content (Inbox, Files), and in the Qt app it moved by the
+  width of the scrollbar when a tab was long enough to scroll.
+
+## 0.13.3
+
+### Fixed
+- **The phone's microphone gave no sound on PipeWire 1.6** (#89): a PipeWire node
+  published the way Linksy did it stops delivering after a moment there (PipeWire's own
+  issue 5378). The microphone is now made through PipeWire's PulseAudio layer (`pactl`): a
+  null sink the audio is played into, and a microphone listening to it. Both are removed
+  when the session ends, and the service asks the helper to stop before it kills it, so
+  they go every time. Where there is no `pactl` it works as before. The camera's PipeWire
+  node (OBS's camera source) is published the same way and is not changed yet; browsers
+  and Zoom use the Linksy Camera device.
+
+## 0.13.2
+
+### Fixed
+- **Firefox still showed twice on the phone** (#87): 0.13.1 matched Plasma's browser
+  integration to the browser's own player only by an identical track title, which a real
+  Firefox doesn't give. The browser's own player now also goes when it names the same
+  desktop entry or app.
+- **The camera ended at once on some installs** (#85): without GStreamer's `capssetter`
+  (the "debug" plugin of gst-plugins-good), every camera session stopped with "no element
+  capssetter". The frame rate is set another way there, and the log says so.
+- **A Ping showed "From <phone>" twice** on the computer: the phone's text already says it.
+- **The wheel on a volume slider jumped to 0, 50 or 100%:** it moves by 5% now, in the
+  GTK app (and by one stop on the camera's exposure).
+- **Notices piling up** when a phone leaves and re-enters its touchpad page: a session
+  allowed without asking is announced once a minute, not at every start.
 
 ## 0.13.1
 

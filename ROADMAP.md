@@ -6,7 +6,7 @@ both sides can work in parallel. Protocol details go into `docs/protocol.md` §4
 
 Effort: **S** = a day or two, **M** = a few days, **L** = a week or more.
 
-Linksy for Linux is at **0.12.4** and Linksy for Android at **0.3.4** (2026-11-05). They have their
+Linksy for Linux is at **0.16.0** and Linksy for Android at **0.3.6** (2026-11-14). They have their
 own version numbers, and this roadmap has none: a feature ships when it is ready, not with a
 number. It says what is **Done**, what is **Now**, **Next** and **Later**. Which side has which
 feature, feature by feature, is `docs/protocol.md` §2.
@@ -37,29 +37,30 @@ feature, feature by feature, is `docs/protocol.md` §2.
 | The phone's notifications on the computer, with reply; the Messages page and copied codes | 0.11.4 | 0.3.2 |
 | **The Inbox**: other notifications, earlier messages, replies after the notification | 0.12.1 | 0.3.3 |
 | **The Gallery**: the phone's photos and videos, page by page | 0.12.1 | 0.3.3 |
-| **The Deck**, with layouts made on the computer (the editor is GTK only) | 0.12.1 | 0.3.3 |
+| **The Deck**: the phone as buttons for the computer; the computer decides what it may run (0.12.1), your own commands with groups, icons and switches, and layouts saved from the phone's own editor (0.14.0) | 0.14.0 | 0.3.5, saving to do |
+| Snap from Phone, the Connection Doctor ("Why Can't I See My Phone?"), a phone's volumes, ringer, Do Not Disturb and flashlight on its page | 0.13.0 | its half built, see Now |
+| This computer's notifications on the phone, the phone's sound with its screen, screens at up to 60 fps, the Inbox and Gallery turned on from the computer | 0.13.0 | see Now |
+| Phone to phone: the route a transfer takes, a check before sending, sending apps | 0.13.0 | in progress |
+| **A welcome on the first run**, in both apps: the phone's app, pairing and Finish Setup in five slides | 0.15.0 | |
+| `linksy doctor` checks what the camera, microphone and screens need and tries them; Finish Setup checks every piece they use | 0.14.1, 0.15.0 | |
+| Away from home carries files through the relay when there is no direct path, at a speed shared between the devices sending | the relay, November 2026 | nothing to do |
 
 ## Now
 
-On main and not in a release yet:
-- **Turn the Inbox or Gallery on from the computer** (§4.21). The phone side is built and needs the core pin that has the message.
-- **Phone to phone** (§4.22): the route a transfer takes, a check before sending, sending apps. The computer side is done; the phone side is in progress.
-- Day headings in the Gallery ("Today", "Yesterday", "Nov 2"), a seek bar that works for browser music, and a service that starts again after a crash.
+The computer's side of everything below is released. What is left is on the phone
+(as the phone's side last reported it; the computer has not seen all of its messages yet):
+- **Saving a deck to the computer** and **custom themes** (§4.26): the editor is in 0.3.5, saving and themes are to do.
+- **Phone to phone** (§4.22): in progress.
+- **Snap to Computer** and **Copy to Computer**, the phone's half of the **Connection Doctor**, and a **USB button**: built, not published.
+- **The phone's controls**, **this computer's notifications on the phone**, **the phone's sound with its screen** and **60 fps** decoding: to do.
+- **Connections that survive a network change**: a phone drops its links when Android reports a network change, even when the Wi-Fi in use hasn't changed, and a transfer cut that way fails instead of carrying on (seen 2026-11-13, phone to phone, 410 MB).
 
-- **Typing on the phone** (§4.26): the core half is merged (a phone that announces `keyboard` takes `text` and `key` frames from a computer over an `input` session, with limits), and the GTK app's "Type on Phone" window and `linksy type` are on a branch. The Qt app's action and the phone's input method are to do; not tried on a phone.
+- **Typing on the phone** (§4.27): the core half is merged (a phone that announces `keyboard` takes `text` and `key` frames from a computer over an `input` session, with limits), and the GTK app's "Type on Phone" window and `linksy type` are on a branch. The Qt app's action and the phone's input method are to do; not tried on a phone.
 
-Built on the phone, not published (from the phone's side; the desktop has not seen its messages yet):
-- **Snap to Computer** and **Copy to Computer**, the phone's half of the **Connection Doctor**, and a **USB button** (`usb_plugged`, `usb_connect`, which the computer already answers).
+On the computer, next:
+- **Deck themes**: your own looks, made on the computer and tried live on the phone (§4.26).
 
-Built on the computer, on branch `phone-work` (not on main yet):
-1. Snap from Phone: the picture lands in Downloads/Linksy and on the clipboard, with a notification to open it (§4.23).
-2. The Connection Doctor: "Why Can't I See My Phone?" in the device list and Finish Setup.
-3. The phone's controls (volumes, ringer, Do Not Disturb, flashlight): Sound and Silence on the phone's page in both apps, `linksy controls`, and Keep Do Not Disturb in Sync on GNOME and KDE (§4.24). The phone side is to do.
-4. This computer's notifications on the phone: a switch per phone in both apps (off until turned on), `linksy forward`, muted apps (§4.25). The phone side is to do.
-5. The phone's sound with its screen (§4.8) and taps turned right for a phone in landscape (§4.11). The phone side is to do, and neither was tried on a phone.
-6. Screens at up to 60 fps with a fallback to 30 (a screen shared over the internet is 4 Mbit/s at 30).
-
-Not done, and why: a Qt deck editor (the GTK one is 4000 lines, and where decks are edited is not decided); datagrams for video and the pointer, BBR over the internet and a bitrate that follows the link while it runs (each needs measuring on a real link first); transfers with no shared network and Bluetooth (the first needs the computer to host a hotspot, which cuts its own Wi-Fi; the second needs a phone); the Wi-Fi Direct speed measurement (needs a phone).
+Not done, and why: datagrams for video and the pointer, BBR over the internet and a bitrate that follows the link while it runs (each needs measuring on a real link first); transfers with no shared network and Bluetooth (the first needs the computer to host a hotspot, which cuts its own Wi-Fi; the second needs a phone); the Wi-Fi Direct speed measurement (needs a phone).
 
 
 ## Now, in detail
@@ -69,7 +70,7 @@ Take a photo or a page with the phone, and it's on the computer straight away.
 - **Phone (built, not published yet):** a "Snap to Computer" action (in the app and as a Quick Settings tile) that
   opens the camera and sends the picture the moment it's taken; for a page, its edges are
   found and it's straightened on the phone, with no Google services.
-- **Desktop:** the picture lands on the clipboard and in Downloads/Linksy, with a
+- **Desktop (done, 0.13.0):** the picture lands on the clipboard and in Downloads/Linksy, with a
   notification to open it. "Snap from Phone" on the phone's page asks the phone to open its
   camera. Both apps.
 - **Done when:** from the computer, Snap from Phone, take the picture, and paste it into a
@@ -78,7 +79,7 @@ Take a photo or a page with the phone, and it's on the computer straight away.
 ### Connection Doctor — M
 Most "it doesn't connect" reports come down to the network or the phone's battery saving.
 One button finds which, says it in a sentence, and fixes what it can.
-- **Desktop:** "Why Can't I See My Phone?" in the device list and Finish Setup checks, in
+- **Desktop (done, 0.13.0):** "Why Can't I See My Phone?" in the device list and Finish Setup checks, in
   order: Linksy's port and mDNS in the firewall; a VPN, or the phone on another network; a
   router that keeps devices apart (their announcements never arrive, the phone's last
   address doesn't answer); the cable's state. Each finding with a button where Linksy can
@@ -93,7 +94,7 @@ One button finds which, says it in a sentence, and fixes what it can.
 - **Phone:** its volumes (media, ringtone, alarm), ringer mode, Do Not Disturb (with
   Android's Do Not Disturb access) and the flashlight, set when the computer asks and
   reported when they change.
-- **Desktop:** sliders and switches for them on the phone's page; "Keep Do Not Disturb in
+- **Desktop (done, 0.13.0):** sliders and switches for them on the phone's page; "Keep Do Not Disturb in
   Sync": the computer's and the phone's follow each other (GNOME and KDE). Both apps.
 - **Done when:** muting the phone from the computer, or turning on Do Not Disturb on the
   computer, silences the phone at once.
@@ -208,7 +209,7 @@ offices): the phone and the computer make their own link.
   away still locks the computer.
 
 ### The computer's notifications on the phone — S
-- **Desktop:** the computer's own notifications, chosen per app and off by default, sent
+- **Desktop (done, 0.13.0):** the computer's own notifications, chosen per app and off by default, sent
   to the phone; never the ones Linksy shows for the phone itself.
 - **Phone:** shown as Android notifications, grouped per computer, with their buttons.
 - **Done when:** a "build finished" or new-mail notification on the computer shows on the
@@ -217,29 +218,30 @@ offices): the phone and the computer make their own link.
 ### The phone's sound with its screen — M
 - **Phone:** while it shares its screen, it also captures what its apps play (Android 10+,
   for apps that allow it) and sends it with the picture.
-- **Desktop:** played in step with the picture, with a mute button in the viewer. Both
+- **Desktop (done, 0.13.0):** played in step with the picture, with a mute button in the viewer. Both
   apps.
 - **Done when:** a video playing on the phone is heard on the computer, in sync, while its
   screen is shown.
 
-### The Qt Deck editor — M
-The phone as a deck of buttons for the computer, laid out exactly the way you want.
-- **Desktop (keeps the layouts):** an editor with the phone drawn true to size, portrait
-  and landscape: tiles (buttons, volume, music, clock) dragged in from a library, moved,
-  resized and themed (Stock, Dot Matrix, E-Ink, Terminal, Pixel), several layouts per
-  phone. What this computer offers, each on or off for that phone: media, volume and
-  mute, microphone mute, the sound output, lock, Do Not Disturb, Wi-Fi, Bluetooth,
-  airplane mode, power modes, restart, shut down, and commands of your own. The phone only
-  ever asks for an action by its id: anything off, or not on the list, is refused. Live
-  state is sent while the deck is open. The GTK editor is done (0.12.1); the Qt app has the deck's actions and layouts but not
-  the editor yet.
-- **Phone (draws it):** the layout from the computer, kept for when it's away, with its
-  own themes if it likes; asks first for restart, shut down and the like; keeps the screen
-  on while the deck shows, dimmed after a minute.
-- **Protocol:** the computer sends its actions, their state and the layouts (§4.19,
-  §4.20); the phone sends "run this action", with a value for a slider.
-- **Done when:** a deck of mixed-size tiles is arranged on the phone by dragging and every
-  tile works on the computer, and an action turned off on the computer stops at once.
+### The Deck, edited on the phone — M
+The phone as a deck of buttons for the computer, laid out exactly the way you want, on the
+phone, where it is touched. The computer decides what the phone may run.
+- **Desktop (decides, keeps, runs):** one page per phone in both apps. What this computer
+  offers, a switch each, by group: media, volume and mute, microphone mute, the sound
+  output, lock, Do Not Disturb, Wi-Fi, Bluetooth, airplane mode, power modes, restart, shut
+  down, and commands of your own (buttons, or switches with a check that says whether
+  they're on, in groups you name, with an icon and an "ask first"). The phone only ever
+  asks for an action by its id: anything off, or not on the list, is refused, and a layout
+  the phone saves never turns one on: what its tiles need that is off shows as asked for,
+  with a notification to allow it. The computer keeps each phone's layouts (§4.26). Done in
+  0.14.0; the GTK editor of 0.12.1 is gone.
+- **Phone (edits and draws it):** the editor is done (0.3.5); saving to the computer
+  (`deck_layout_save`) and custom themes (`deck_themes`) are to do on the phone.
+- **Themes (next, desktop):** your own looks, made on the computer from one of the five and
+  shown live on the phone before they're kept (§4.26, `deck_theme_draft`).
+- **Done when:** a deck is arranged on the phone, saved to the computer, and every tile
+  works; an action turned off on the computer stops at once, and one the phone asks for
+  waits for your OK.
 
 ### Calls on the computer — L
 - **Control:** see who's calling, answer, decline and hang up from the computer (the phone
@@ -268,13 +270,6 @@ what's playing and where.
   link; the plain link elsewhere).
 - **Done when:** a YouTube video playing on the phone carries on on the computer within a
   second of where it was.
-
-### Onboarding — M
-At most five slides, skippable, shown once: welcome; get the phone app (a QR code to the
-download); pair; finish setup (the dependency check, each missing piece with its fix
-button); done, with where the main features are.
-- **Done when:** a fresh install goes from first launch to a paired phone, with every
-  feature the computer can do working, without opening a terminal.
 
 ---
 
@@ -318,6 +313,15 @@ People who made Linksy better by reporting, testing or building:
   Setup on Artix without systemd (0.9.13, 0.9.14).
 - [@bearyjd](https://github.com/LinkSy-mg/linksy-desktop/pull/56): device names cleaned
   before they're shown, so they can't disguise a pairing prompt (0.9.14).
+- [@MrAvana](https://github.com/LinkSy-mg/linksy-desktop/issues/89): the phone's
+  microphone going silent on PipeWire 1.6, with the cause, the fix and the levels measured
+  on a real phone (0.13.3, 0.14.1).
+- [@bikathi](https://github.com/LinkSy-mg/linksy-desktop/issues/85): the camera closing at
+  once where GStreamer lacks a plugin (0.14.1).
+- [@ichirou2910](https://github.com/LinkSy-mg/linksy-desktop/pull/88): the Arch packages no
+  longer depending on each other (0.15.0).
+- [@Lur1fa](https://github.com/LinkSy-mg/linksy-desktop/pull/90): the service no longer
+  starting for the login screen, which kept phones from reconnecting on GNOME (0.15.0).
 
 ## How each feature ships
 

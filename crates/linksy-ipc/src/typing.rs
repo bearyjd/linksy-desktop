@@ -1,4 +1,4 @@
-//! Typing on a phone from this computer (docs/protocol.md §4.26), without any toolkit: which
+//! Typing on a phone from this computer (docs/protocol.md §4.27), without any toolkit: which
 //! devices to offer it for, what a key press or a paste becomes on the wire, and what to tell
 //! the person as the session goes. The GTK window and `linksy type` only wire this up.
 

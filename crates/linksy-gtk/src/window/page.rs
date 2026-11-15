@@ -432,7 +432,7 @@ impl DevicePage {
         buttons.append(&mic_start);
         buttons.append(&mic_running);
         let (deck_card, buttons, deck_desc, _) = card("view-grid-symbolic", t!("Deck"), "");
-        buttons.append(&start(t!("Choose Actions…"), || Action::Deck));
+        buttons.append(&start(t!("Manage Deck…"), || Action::Deck));
         let cards = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .homogeneous(true)
@@ -660,7 +660,9 @@ impl DevicePage {
         let settings_page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(22).build();
         settings_page.append(&settings);
         settings_page.append(&forget_button);
-        let tab_stack = gtk::Stack::builder().vhomogeneous(false).hhomogeneous(false).transition_type(gtk::StackTransitionType::Crossfade).transition_duration(120).build();
+        // Every tab asks for the widest one's width, or the clamp around them gives the column a
+        // different width on each tab and the whole page shifts as they change
+        let tab_stack = gtk::Stack::builder().vhomogeneous(false).hhomogeneous(true).transition_type(gtk::StackTransitionType::Crossfade).transition_duration(120).build();
         tab_stack.add_named(&use_page, Some(Tab::Use.name()));
         tab_stack.add_named(&inbox_view, Some(Tab::Inbox.name()));
         tab_stack.add_named(&gallery_view, Some(Tab::Gallery.name()));
@@ -1062,7 +1064,13 @@ impl DevicePage {
         let available = d.connected || d.nearby;
         let phone = matches!(d.device.kind, DeviceKind::Phone | DeviceKind::Tablet);
         let (icon, what) = if d.connected && d.away {
-            ("network-wireless-hotspot-symbolic", t!("Away from home").to_string())
+            // Through the relay is the slower way: said, so a slow transfer has its reason
+            let how = match d.away_relay {
+                Some(true) => t!("Away from home, through the relay"),
+                Some(false) => t!("Away from home, direct"),
+                None => t!("Away from home"),
+            };
+            ("network-wireless-hotspot-symbolic", how.to_string())
         } else if d.connected && d.usb {
             ("media-removable-symbolic", t!("USB").to_string())
         } else if d.connected && phone {

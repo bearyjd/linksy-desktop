@@ -295,13 +295,16 @@ impl Sessions {
             // The helper gave up (dialog cancelled, no portal): nothing will connect.
             status = child.wait() => {
                 let _ = std::fs::remove_file(&path);
-                return Err(std::io::Error::other(format!("screen capture stopped ({})", status?)));
+                let status = status?;
+                say_missing_piece(status, &session.peer.name);
+                return Err(std::io::Error::other(format!("screen capture stopped ({status})")));
             }
         };
         let _ = std::fs::remove_file(&path);
         let (stream, _) = accepted.map_err(|_| std::io::Error::other("no screen was picked in time"))??;
         relay(&mut session, stream).await;
-        let _ = child.kill().await;
+        helper_ended(&mut child, &session.peer.name).await;
+        stop_helper(&mut child).await;
         Ok(())
     }
 
@@ -338,7 +341,9 @@ impl Sessions {
                 a = tokio::time::timeout(VIEW_TIMEOUT, listener.accept()) => a,
                 status = child.wait() => {
                     let _ = std::fs::remove_file(&path);
-                    return Err(std::io::Error::other(format!("the webcam stopped ({})", status?)));
+                    let status = status?;
+                    say_missing_piece(status, &session.peer.name);
+                    return Err(std::io::Error::other(format!("the webcam stopped ({status})")));
                 }
             };
             let _ = std::fs::remove_file(&path);
@@ -355,11 +360,19 @@ impl Sessions {
                         }
                         Ok(n) => {
                             if local.write_all(&buf[..n]).await.is_err() {
+                                helper_ended(&mut child, &session.peer.name).await;
                                 let _ = session.send.shutdown().await;
                                 return Ok(());
                             }
                         }
                     },
+                    // The helper gave up by itself: the phone's stream would go nowhere
+                    status = child.wait() => {
+                        let _ = session.send.shutdown().await;
+                        let status = status?;
+                        say_missing_piece(status, &session.peer.name);
+                        return Err(std::io::Error::other(format!("the webcam stopped ({status})")));
+                    }
                     Some(frame) = control.recv() => {
                         if session.send.write_all(&frame).await.is_err() {
                             let _ = child.kill().await;
@@ -799,6 +812,50 @@ fn scopes() -> bool {
     })
 }
 
+/// What `linksy-screen` exits with when GStreamer lacks something it needs.
+const MISSING_PIECE: i32 = 3;
+
+/// A session that ended because this computer lacks a piece is said, not only logged: the
+/// phone's screen just closed otherwise (desktop#85). Once a minute at most.
+fn say_missing_piece(status: std::process::ExitStatus, device: &str) {
+    static SAID: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if status.code() != Some(MISSING_PIECE) {
+        return;
+    }
+    let mut said = SAID.lock().unwrap();
+    if said.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+        return;
+    }
+    *said = Some(std::time::Instant::now());
+    #[cfg(target_os = "linux")]
+    crate::notify::show(
+        linksy_i18n::t!("Something Is Missing on This Computer").into(),
+        linksy_i18n::t!("What {device} started ended at once: GStreamer lacks a piece it needs here. Open Linksy, Finish Setup shows what to install.", device = device),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = device;
+}
+
+/// A helper whose socket closed: if it has ended by itself, why is looked at.
+async fn helper_ended(child: &mut tokio::process::Child, device: &str) {
+    if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_millis(150), child.wait()).await {
+        say_missing_piece(status, device);
+    }
+}
+
+/// Ends a helper politely: SIGTERM, and a moment to put back what it made (the microphone's
+/// virtual source), before it is killed.
+async fn stop_helper(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: a plain kill(2) to a child this process started
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_ok() {
+            return;
+        }
+    }
+    let _ = child.kill().await;
+}
+
 /// A helper's command line, in a memory budget of its own: a systemd scope capped at 512 MB
 /// (a phone-shaped second display needs 150-250 MB), so it never runs into the service's
 /// own small cap. The helper runs in place (same process), and the scope goes away with
@@ -866,6 +923,35 @@ mod tests {
 
 /// Needs a running Sway or Hyprland (SWAYSOCK or HYPRLAND_INSTANCE_SIGNATURE), e.g. a
 /// headless Sway: `WLR_BACKENDS=headless sway`.
+#[cfg(test)]
+mod stop_tests {
+    use std::time::{Duration, Instant};
+
+    use super::stop_helper;
+
+    fn sh(script: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sh").arg("-c").arg(script).kill_on_drop(true).spawn().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_helper_is_asked_to_stop_and_goes_at_once() {
+        let mut child = sh("sleep 30");
+        let started = Instant::now();
+        stop_helper(&mut child).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_ignores_the_request_is_killed_after_a_moment() {
+        let mut child = sh("trap '' TERM; sleep 5");
+        // The shell has to be running its trap before it is asked
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop_helper(&mut child).await;
+        assert!(child.try_wait().unwrap().is_some());
+    }
+}
+
 #[cfg(test)]
 mod compositor_tests {
     use super::*;

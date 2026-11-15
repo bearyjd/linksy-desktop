@@ -9,6 +9,11 @@ Kirigami.ScrollablePage {
     id: page
     required property var app
     title: "Linksy"
+    // Kirigami adds a gap around the list on top of the rows' own: the rows keep their inset
+    // (the same as the island's and the buttons' under the list), nothing more
+    topPadding: Kirigami.Units.smallSpacing
+    leftPadding: 0
+    rightPadding: 0
 
     // As wide as it's dragged (Main.qml remembers it), never so narrow that the island clips
     // or the title runs into Add Device. Set here, not as bindings: before Kirigami 6.16 these
@@ -17,7 +22,8 @@ Kirigami.ScrollablePage {
         const column = page.Kirigami.ColumnView;
         if (column.interactiveResizeEnabled === undefined) return;
         column.minimumWidth = Qt.binding(() => Math.max(Kirigami.Units.gridUnit * 13, island.implicitWidth + island.Layout.leftMargin + island.Layout.rightMargin + footer.leftPadding + footer.rightPadding));
-        column.preferredWidth = Qt.binding(() => Kirigami.Units.gridUnit * 20);
+        // Small to begin with, as the GTK app's list is (about 270 px); dragged wider, it stays so
+        column.preferredWidth = Qt.binding(() => Math.max(column.minimumWidth, Kirigami.Units.gridUnit * 15));
         column.maximumWidth = Qt.binding(() => Kirigami.Units.gridUnit * 30);
         column.interactiveResizeEnabled = true;
     }
@@ -98,9 +104,15 @@ Kirigami.ScrollablePage {
     ColumnLayout {
         spacing: 0
 
+        // Kirigami's headers are roomy above and below: tighter, and the rows follow close under
         Kirigami.ListSectionHeader {
             Layout.fillWidth: true
             visible: page.paired.length > 0
+            topPadding: Kirigami.Units.smallSpacing * 2
+            bottomPadding: 0
+            // In line with the rows' avatars and names
+            leftPadding: Kirigami.Units.smallSpacing * 4
+            rightPadding: Kirigami.Units.smallSpacing * 4
             text: app.t("Your Devices")
         }
         Repeater {
@@ -110,6 +122,10 @@ Kirigami.ScrollablePage {
         Kirigami.ListSectionHeader {
             Layout.fillWidth: true
             visible: page.nearby.length > 0
+            topPadding: Kirigami.Units.smallSpacing * 2
+            bottomPadding: 0
+            leftPadding: Kirigami.Units.smallSpacing * 4
+            rightPadding: Kirigami.Units.smallSpacing * 4
             text: app.t("Nearby, Not Paired")
         }
         Repeater {
@@ -212,6 +228,9 @@ Kirigami.ScrollablePage {
             }
             QQC2.Button {
                 Layout.fillWidth: true
+                // The island's own margin, so it and the buttons under it are as wide
+                Layout.leftMargin: Kirigami.Units.smallSpacing
+                Layout.rightMargin: Kirigami.Units.smallSpacing
                 // Screenshots (LINKSY_SCREENSHOT) show the app as on a finished setup
                 readonly property int missing: backend.env("LINKSY_SCREENSHOT") ? 0 : (app.setup?.missing ?? 0)
                 visible: missing > 0
@@ -221,6 +240,8 @@ Kirigami.ScrollablePage {
             }
             QQC2.Button {
                 Layout.fillWidth: true
+                Layout.leftMargin: Kirigami.Units.smallSpacing
+                Layout.rightMargin: Kirigami.Units.smallSpacing
                 visible: app.update !== null
                 flat: true
                 icon.name: "update-none"

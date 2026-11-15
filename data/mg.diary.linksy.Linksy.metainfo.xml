@@ -44,8 +44,8 @@
       <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/inbox.png</image>
     </screenshot>
     <screenshot>
-      <caption>Lay out the phone's deck of buttons for the computer</caption>
-      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/deck-editor.png</image>
+      <caption>Choose what the phone's deck of buttons may do on the computer, and add commands of your own</caption>
+      <image>https://raw.githubusercontent.com/LinkSy-mg/linksy-desktop/main/data/screenshots/deck-page.png</image>
     </screenshot>
     <screenshot>
       <caption>Pair a device by scanning a QR code</caption>
@@ -82,6 +82,36 @@
     <keyword>nearby</keyword>
   </keywords>
   <releases>
+    <release version="0.16.0" date="2026-11-14">
+      <description>
+        <p>A device's page now says how it is reached away from home: direct, or through the relay, which is the slower way. Before something of 200 MB or more goes through the relay, the apps say how much it is and ask first. In both apps.</p>
+      </description>
+    </release>
+    <release version="0.15.0" date="2026-11-13">
+      <description>
+        <p>A welcome on the first run, in both apps: what Linksy does, the phone's app, pairing and Finish Setup, in five slides you can skip. linksy doctor now checks what the camera, microphone and screens need, and tries them. Fixes: paired phones reconnect after a restart on GNOME, the packages bring everything the camera and screen sharing need, and Finish Setup checks sound and the microphone.</p>
+      </description>
+    </release>
+    <release version="0.14.1" date="2026-11-12">
+      <description>
+        <p>Fixes: the phone's camera no longer closes at once where GStreamer lacks v4l2sink, a session that can't start for a missing piece says so in a notification, Finish Setup checks what the camera needs, and the phone's microphone is 12 dB louder.</p>
+      </description>
+    </release>
+    <release version="0.14.0" date="2026-11-11">
+      <description>
+        <p>The deck is edited on the phone: the computer's page is now a grid of switches by group, what the phone's saved deck asked for, and your own commands, which can have a group, an icon and be switches. A phone can no longer turn an action on by putting it on its deck. The Qt app's device page matches the GTK app's, and a device's page no longer shifts as you change tabs.</p>
+      </description>
+    </release>
+    <release version="0.13.3" date="2026-11-10">
+      <description>
+        <p>Fix: the phone's microphone no longer goes silent after a moment on PipeWire 1.6.</p>
+      </description>
+    </release>
+    <release version="0.13.2" date="2026-11-09">
+      <description>
+        <p>Fixes: Firefox no longer shows twice on the phone with Plasma's browser integration, the camera works where GStreamer lacks capssetter, a Ping names its phone once, the wheel on a volume slider moves by 5%, and a session allowed without asking is announced once a minute.</p>
+      </description>
+    </release>
     <release version="0.13.1" date="2026-11-07">
       <description>
         <p>Fixes: a browser's track no longer shows twice on the phone with Plasma's browser integration, taps on a phone used as a second screen follow a scaled KDE screen, the deck editor offers only the colours a theme draws, and Finish Setup keeps a log of what its helper printed.</p>

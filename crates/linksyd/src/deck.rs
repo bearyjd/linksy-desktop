@@ -1,31 +1,34 @@
 //! Phones' decks (docs/protocol.md §4.19): this computer says what each phone may do and
 //! does it. Every action is on or off per phone (media and sound on until the user says
-//! otherwise, locking and the user's own commands off), kept in `deck.json` with the
-//! commands and each phone's layouts (§4.20). Whatever else a phone runs is ignored.
+//! otherwise, restarting, turning off and the user's own commands off), kept in `deck.json`
+//! with the commands, the themes and each phone's layouts, which the phone edits and saves
+//! (§4.20, §4.26). Whatever else a phone runs is ignored.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use linksy_core::deck_layout::{self, MAX_BYTES};
-use linksy_core::{DeckAction, DeckFace, DeckKind, DeckLayout, DeckLayouts, DeckState, DeckTheme, DeckTile, Event, Fingerprint, MediaCommand, Node, Uuid};
+use linksy_core::{DeckAction, DeckFace, DeckKind, DeckLayout, DeckLayouts, DeckRefusal, DeckState, DeckTheme, DeckThemeDef, DeckTile, Event, Fingerprint, MediaCommand, Node, Uuid};
 use linksy_i18n::t;
-use linksy_ipc::{DeckCommand, DeckOption, DeckPrefs};
+use linksy_ipc::{CommandKind, DeckCommand, DeckLayoutInfo, DeckOption, DeckPrefs};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::deck_cmd::{self, MAX_COMMANDS};
+
 pub static DECK: OnceLock<Deck> = OnceLock::new();
 
-/// So a deck's list stays well within what a phone takes in one message.
-const MAX_COMMANDS: usize = 100;
-const MAX_NAME: usize = 100;
 /// Longest one action may hold the next ones up (a player that doesn't answer).
 const ACT_WAIT: Duration = Duration::from_secs(5);
+/// How often the user's toggles are asked while a deck shows what they are.
+const POLL: Duration = Duration::from_secs(3);
+/// At most this many of a toggle's checks run at once.
+const CHECKS_AT_ONCE: usize = 4;
 
 const MEDIA: &str = "Media";
 const SOUND: &str = "Sound";
@@ -55,6 +58,8 @@ pub enum Act {
     Profile(&'static str),
     PowerAuto,
     Command { name: String, line: String },
+    /// One of the user's toggles: its `state` check says which of `on` and `off` to run.
+    CommandToggle { name: String, on: String, off: String, state: String },
 }
 
 /// What this computer can do for a deck besides media and locking, found out once.
@@ -93,6 +98,8 @@ pub struct Status {
     /// The power profile now, as powerprofilesctl names it.
     pub profile: Option<String>,
     pub power_auto: Option<bool>,
+    /// Whether each of the user's toggles is on, by its action id; the ones that answered.
+    pub commands: HashMap<String, bool>,
 }
 
 /// What runs the actions: this desktop, or a stand-in in tests.
@@ -101,6 +108,8 @@ pub trait Desktop: Send + Sync + 'static {
     fn run(&self, act: Act) -> impl Future<Output = ()> + Send;
     /// The state of what the actions `ids` show; the rest stays unknown.
     fn status(&self, ids: &HashSet<&str>) -> impl Future<Output = Status> + Send;
+    /// What a toggle's check says (it exits 0 while on); none if it can't say.
+    fn check(&self, line: &str) -> impl Future<Output = Option<bool>> + Send;
 }
 
 pub struct System {
@@ -148,8 +157,17 @@ impl Desktop for System {
             Act::Airplane => self.controls.toggle_airplane().await,
             Act::Profile(profile) => self.controls.set_profile(profile).await,
             Act::PowerAuto => self.controls.toggle_power_auto().await,
-            Act::Command { name, line } => spawn(&name, &line),
+            Act::Command { name, line } => deck_cmd::spawn(&name, &line),
+            Act::CommandToggle { name, on, off, state } => {
+                let line = deck_cmd::toggle_line(deck_cmd::check(&state).await, &on, &off).to_string();
+                // Waited for, so the state read after it is the new one
+                deck_cmd::run_waiting(&name, &line, ACT_WAIT).await;
+            }
         }
+    }
+
+    async fn check(&self, line: &str) -> Option<bool> {
+        deck_cmd::check(line).await
     }
 
     async fn status(&self, ids: &HashSet<&str>) -> Status {
@@ -181,30 +199,8 @@ impl Desktop for System {
             airplane,
             profile,
             power_auto,
+            commands: HashMap::new(),
         }
-    }
-}
-
-/// Start one of the user's commands on its own (from the Flatpak, on the computer): it reads
-/// nothing, its output goes nowhere, and nothing waits for it.
-fn spawn(name: &str, line: &str) {
-    let mut command = tokio::process::Command::from(linksy_host::detached("sh", &[]));
-    command.args(["-c", line]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
-    if let Some(home) = std::env::var_os("HOME") {
-        command.current_dir(home);
-    }
-    match command.spawn() {
-        Ok(mut child) => {
-            let name = name.to_string();
-            tokio::spawn(async move {
-                if let Ok(status) = child.wait().await
-                    && !status.success()
-                {
-                    debug!("deck command {name}: {status}");
-                }
-            });
-        }
-        Err(e) => warn!("could not run the deck command {name}: {e}"),
     }
 }
 
@@ -216,6 +212,10 @@ struct Saved {
     commands: Vec<DeckCommand>,
     /// Each phone's layouts as the user saved them.
     layouts: HashMap<Fingerprint, DeckLayouts>,
+    /// The user's own deck themes (docs/protocol.md §4.26), which every phone's layouts may name.
+    themes: Vec<DeckThemeDef>,
+    /// When each phone last saved its layouts from the phone, in ms since the epoch.
+    layouts_at: HashMap<Fingerprint, u64>,
 }
 
 impl Saved {
@@ -230,16 +230,47 @@ impl Saved {
     }
 }
 
+/// Why a phone's save wasn't kept (docs/protocol.md §4.26), and the version kept now.
+#[derive(Debug, PartialEq)]
+pub struct Refused {
+    pub code: DeckRefusal,
+    pub reason: String,
+    pub version: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The actions `phone`'s saved tiles run that are off for it: what it asked for, in the
+/// order `offered`.
+fn asked_in(offered: &[DeckAction], saved: &Saved, phone: &Fingerprint) -> Vec<String> {
+    let Some(layouts) = saved.layouts.get(phone) else { return Vec::new() };
+    let used: HashSet<&str> = runs(layouts).collect();
+    offered.iter().filter(|a| used.contains(a.id.as_str()) && !saved.on(phone, &a.id)).map(|a| a.id.clone()).collect()
+}
+
 enum Job {
     /// A phone's deck shows: its list, then the state.
     Open(Fingerprint),
     Run(Fingerprint, Act),
     /// What a phone may do changed (`None`: any phone): its list again, if its deck shows.
     Actions(Option<Fingerprint>),
-    /// A phone's layouts were saved: its list and layouts again, if its deck shows.
-    Layouts(Fingerprint),
     /// The volume changed.
     Sound,
+    /// Time to ask the user's toggles what they are now.
+    Poll,
+}
+
+/// What a batch of jobs makes the state read again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    /// Everything the decks show.
+    All,
+    /// Only the volume and mute (a slider, the keyboard).
+    Sound,
+    /// Only the user's toggles.
+    Commands,
 }
 
 pub struct Deck<D: Desktop = System> {
@@ -266,6 +297,8 @@ struct Inner<D> {
     status: Mutex<Status>,
     /// For the names in the questions actions ask.
     node: OnceLock<Node>,
+    /// What each phone has been told it asked for, so it is said once (see [`Deck::news`]).
+    said: Mutex<HashMap<Fingerprint, HashSet<String>>>,
 }
 
 impl<D: Desktop> Deck<D> {
@@ -282,6 +315,7 @@ impl<D: Desktop> Deck<D> {
             caps: tokio::sync::OnceCell::new(),
             status: Mutex::default(),
             node: OnceLock::new(),
+            said: Mutex::default(),
         };
         Self { inner: Arc::new(inner) }
     }
@@ -299,7 +333,7 @@ impl<D: Desktop> Deck<D> {
     /// `{phone}`, for [`Deck::named`].
     fn offered(&self, saved: &Saved) -> Vec<DeckAction> {
         let caps = self.caps();
-        let action = |id: &str, name: &str, kind, group: &str| DeckAction { id: id.into(), name: name.into(), kind, group: group.into(), confirm: None };
+        let action = |id: &str, name: &str, kind, group: &str| DeckAction { id: id.into(), name: name.into(), kind, group: group.into(), confirm: None, icon: None };
         let mut all = vec![
             action("media.play_pause", t!("Play or Pause"), DeckKind::Button, MEDIA),
             action("media.next", t!("Next Track"), DeckKind::Button, MEDIA),
@@ -344,7 +378,17 @@ impl<D: Desktop> Deck<D> {
         if caps.power_auto {
             all.push(action("power.auto", t!("Power Saver on Low Battery"), DeckKind::Toggle, POWER));
         }
-        all.extend(saved.commands.iter().map(|c| action(&format!("command.{}", c.id), &c.name, DeckKind::Button, COMMANDS)));
+        all.extend(saved.commands.iter().map(|c| {
+            let kind = if c.kind == CommandKind::Toggle { DeckKind::Toggle } else { DeckKind::Button };
+            let mut a = action(&format!("command.{}", c.id), &c.name, kind, if c.group.is_empty() { COMMANDS } else { &c.group });
+            if !c.icon.is_empty() {
+                a.icon = Some(c.icon.clone());
+            }
+            if c.confirm {
+                a.confirm = Some(t!("Run {name}?", name = c.name));
+            }
+            a
+        }));
         all
     }
 
@@ -361,9 +405,16 @@ impl<D: Desktop> Deck<D> {
         let offered = self.offered(&saved);
         let on: Vec<bool> = offered.iter().map(|a| saved.on(phone, &a.id)).collect();
         let commands = saved.commands.clone();
+        let asked = asked_in(&offered, &saved, phone);
+        let layout = saved.layouts.get(phone).map(|l| DeckLayoutInfo {
+            version: l.version,
+            name: l.layouts.iter().find(|x| x.id == l.active).map(|x| x.name.clone()).unwrap_or_default(),
+            layouts: l.layouts.len(),
+            saved_at: saved.layouts_at.get(phone).copied(),
+        });
         drop(saved);
         let actions = self.named(phone, offered).into_iter().zip(on).map(|(action, on)| DeckOption { action, on }).collect();
-        DeckPrefs { actions, commands }
+        DeckPrefs { actions, commands, asked, layout, icons: deck_layout::ICONS.iter().map(|i| i.to_string()).collect() }
     }
 
     /// The questions with this computer's name and `phone`'s.
@@ -396,19 +447,16 @@ impl<D: Desktop> Deck<D> {
         let mut kept = HashSet::new();
         let mut list = Vec::with_capacity(commands.len());
         for c in commands {
-            let (name, command) = (c.name.trim(), c.command.trim());
-            if name.is_empty() || command.is_empty() {
-                return Err("each command needs a name and a command line".into());
-            }
-            if name.chars().count() > MAX_NAME {
-                return Err(format!("a command's name can be at most {MAX_NAME} characters long"));
-            }
+            let mut c = deck_cmd::clean(c)?;
             let known = saved.commands.iter().any(|s| s.id == c.id) && kept.insert(c.id.clone());
-            let id = if known { c.id } else { Uuid::new_v4().simple().to_string() };
-            list.push(DeckCommand { id, name: name.into(), command: command.into() });
+            if !known {
+                c.id = Uuid::new_v4().simple().to_string();
+            }
+            list.push(c);
         }
         let ids: HashSet<String> = list.iter().map(|c| format!("command.{}", c.id)).collect();
-        let mut next = Saved { phones: saved.phones.clone(), commands: list, layouts: saved.layouts.clone() };
+        let mut next = saved.clone();
+        next.commands = list;
         for choices in next.phones.values_mut() {
             choices.retain(|id, _| !id.starts_with("command.") || ids.contains(id));
         }
@@ -429,34 +477,64 @@ impl<D: Desktop> Deck<D> {
         }
     }
 
-    /// Save `phone`'s layouts, one version on from the last. Placing a tile allows its
-    /// action: each one a tile runs is turned on for that phone.
-    pub fn set_layouts(&self, phone: &Fingerprint, mut layouts: DeckLayouts) -> Result<DeckLayouts, String> {
+    /// What a phone saved from its own editor (docs/protocol.md §4.26), made on
+    /// `base_version`. It is kept only when that is the version kept now, and it never turns
+    /// an action on: a tile whose action is off shows as unavailable until the user allows it.
+    pub fn save_from_phone(&self, phone: &Fingerprint, base_version: u64, mut layouts: DeckLayouts) -> Result<DeckLayouts, Refused> {
+        let mut saved = self.inner.saved.lock().unwrap();
+        let current = match saved.layouts.get(phone) {
+            Some(kept) => kept.clone(),
+            None => self.first_layouts(&saved),
+        };
+        let version = current.version;
+        let refuse = |code, reason: String| Refused { code, reason, version };
+        if base_version != version {
+            return Err(refuse(DeckRefusal::Stale, "the layouts on this computer changed since the ones you edited".into()));
+        }
+        // The computer's own themes are the ones that count, whatever came with the save
+        layouts.themes.clear();
         if !layouts.layouts.iter().any(|l| l.id == layouts.active) {
             layouts.active = layouts.layouts.first().map(|l| l.id.clone()).unwrap_or_default();
         }
-        let mut saved = self.inner.saved.lock().unwrap();
+        layouts.version = version;
+        if layouts == current {
+            return Ok(current);
+        }
         let offered: HashSet<String> = self.offered(&saved).into_iter().map(|a| a.id).collect();
         // A tile kept from before whose action this computer no longer offers (a tool
         // removed) doesn't stop the save: the phone shows it as unavailable
-        let before: HashSet<String> = saved.layouts.get(phone).map(|l| runs(l).map(String::from).collect()).unwrap_or_default();
-        layouts.check(|a| offered.contains(a) || before.contains(a))?;
-        layouts.version = saved.layouts.get(phone).map_or(0, |l| l.version) + 1;
-        let size = serde_json::to_vec(&layouts).map_err(|e| e.to_string())?.len();
+        let before: HashSet<&str> = runs(&current).collect();
+        let custom: HashSet<&str> = saved.themes.iter().map(|t| t.id.as_str()).collect();
+        layouts.check_with(|a| offered.contains(a) || before.contains(a), |id| custom.contains(id)).map_err(|why| refuse(DeckRefusal::Invalid, why))?;
+        layouts.version = version + 1;
+        let size = serde_json::to_vec(&layouts).map_err(|e| refuse(DeckRefusal::Invalid, e.to_string()))?.len();
         if size > MAX_BYTES {
-            return Err(format!("these layouts are too big to send to the phone ({} KiB, at most {} KiB)", size.div_ceil(1024), MAX_BYTES / 1024));
+            return Err(refuse(DeckRefusal::TooBig, format!("these layouts are too big to send back ({} KiB, at most {} KiB)", size.div_ceil(1024), MAX_BYTES / 1024)));
         }
         let mut next = saved.clone();
-        let choices = next.phones.entry(*phone).or_default();
-        for action in runs(&layouts).filter(|a| offered.contains(*a)) {
-            choices.insert(action.into(), true);
-        }
         next.layouts.insert(*phone, layouts.clone());
-        self.save(&next)?;
+        next.layouts_at.insert(*phone, now_ms());
+        self.save(&next).map_err(|why| refuse(DeckRefusal::Invalid, why))?;
         *saved = next;
-        drop(saved);
-        let _ = self.inner.jobs.send(Job::Layouts(*phone));
         Ok(layouts)
+    }
+
+    /// The actions `phone` has been newly asked to allow by what it saved: their ids and
+    /// names, none when it has been told about all of them already. Allowed or taken off
+    /// its tiles, an action is forgotten, so asking for it again is news again.
+    fn news(&self, phone: &Fingerprint) -> Vec<(String, String)> {
+        let (asked, names) = {
+            let saved = self.inner.saved.lock().unwrap();
+            let offered = self.offered(&saved);
+            let asked = asked_in(&offered, &saved, phone);
+            let names: Vec<(String, String)> = offered.into_iter().filter(|a| asked.contains(&a.id)).map(|a| (a.id, a.name)).collect();
+            (asked, names)
+        };
+        let mut said = self.inner.said.lock().unwrap();
+        let told = said.entry(*phone).or_default();
+        let fresh = asked.iter().any(|id| !told.contains(id));
+        *told = asked.into_iter().collect();
+        if fresh { names } else { Vec::new() }
     }
 
     /// The layout a deck has until the user saves one: the clock, the player, the volume,
@@ -506,7 +584,7 @@ impl<D: Desktop> Deck<D> {
             portrait: face(DeckFace::portrait(), (0, 0), (0, 1), (0, 3)),
             landscape: face(DeckFace::landscape(), (4, 0), (0, 0), (0, 2)),
         };
-        DeckLayouts { version: 0, active: layout.id.clone(), layouts: vec![layout] }
+        DeckLayouts { version: 0, active: layout.id.clone(), layouts: vec![layout], themes: Vec::new() }
     }
 
     fn save(&self, saved: &Saved) -> Result<(), String> {
@@ -547,7 +625,10 @@ impl<D: Desktop> Deck<D> {
             _ => {
                 let id = id.strip_prefix("command.")?;
                 let c = saved.commands.iter().find(|c| c.id == id)?;
-                Act::Command { name: c.name.clone(), line: c.command.clone() }
+                match c.kind {
+                    CommandKind::Button => Act::Command { name: c.name.clone(), line: c.command.clone() },
+                    CommandKind::Toggle => Act::CommandToggle { name: c.name.clone(), on: c.command.clone(), off: c.off.clone(), state: c.state.clone() },
+                }
             }
         })
     }
@@ -558,8 +639,15 @@ impl<D: Desktop> Deck<D> {
         tokio::spawn(self.clone().work(node.clone(), jobs));
         let mut events = node.subscribe();
         let paired = |id: &Fingerprint| node.trusted().iter().any(|t| t.device.id == *id);
+        let mut poll = tokio::time::interval(POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _ = poll.tick() => {
+                    if self.shows_toggles() {
+                        let _ = self.inner.jobs.send(Job::Poll);
+                    }
+                }
                 event = events.recv() => match event {
                     Ok(Event::DeckOpen { from }) if paired(&from.id) => {
                         self.inner.open.lock().unwrap().insert(from.id, None);
@@ -574,7 +662,11 @@ impl<D: Desktop> Deck<D> {
                             None => debug!("{} may not run {action} here", from.name),
                         }
                     }
-                    Ok(Event::DeckOpen { from } | Event::DeckRun { from, .. }) => debug!("deck of {}, which isn't paired", from.name),
+                    Ok(Event::DeckLayoutSave { from, base_version, layouts }) if paired(&from.id) => {
+                        self.ready().await;
+                        self.answer_save(&node, &from.id, &from.name, base_version, layouts).await;
+                    }
+                    Ok(Event::DeckOpen { from } | Event::DeckRun { from, .. } | Event::DeckLayoutSave { from, .. }) => debug!("deck of {}, which isn't paired", from.name),
                     Ok(Event::DeckClose { from }) => {
                         self.inner.open.lock().unwrap().remove(&from.id);
                     }
@@ -602,8 +694,15 @@ impl<D: Desktop> Deck<D> {
                 batch.push(job);
             }
             self.ready().await;
-            // Only the volume moved (a slider, the keyboard): read the sound alone again
-            let sound_only = batch.iter().all(|j| matches!(j, Job::Sound | Job::Run(_, Act::Volume(_))));
+            // Only the volume moved (a slider, the keyboard): read the sound alone again; only
+            // time passed: ask the user's toggles
+            let refresh = if batch.iter().all(|j| matches!(j, Job::Sound | Job::Run(_, Act::Volume(_)))) {
+                Refresh::Sound
+            } else if batch.iter().all(|j| matches!(j, Job::Poll)) {
+                Refresh::Commands
+            } else {
+                Refresh::All
+            };
             let mut told = HashSet::new();
             let mut acts = Vec::new();
             for job in batch {
@@ -612,7 +711,7 @@ impl<D: Desktop> Deck<D> {
                         told.insert(phone);
                         acts.push(act);
                     }
-                    Job::Open(phone) | Job::Layouts(phone) => {
+                    Job::Open(phone) => {
                         told.insert(phone);
                         self.send_actions(&node, phone).await;
                         self.send_layouts(&node, phone).await;
@@ -624,11 +723,11 @@ impl<D: Desktop> Deck<D> {
                             self.send_actions(&node, phone).await;
                         }
                     }
-                    Job::Sound => {}
+                    Job::Sound | Job::Poll => {}
                 }
             }
             self.perform(acts).await;
-            self.send_states(&node, &told, sound_only).await;
+            self.send_states(&node, &told, refresh).await;
         }
     }
 
@@ -670,30 +769,109 @@ impl<D: Desktop> Deck<D> {
         if !self.reachable(node, &phone) {
             return;
         }
-        match node.deck_layout(&phone, &self.layouts(&phone)).await {
-            Ok(()) | Err(linksy_core::Error::Unsupported) => {}
-            Err(e) => {
-                debug!("deck layouts: {e}");
-                self.inner.open.lock().unwrap().remove(&phone);
-            }
+        if let Err(e) = self.push_layouts(node, &phone).await {
+            debug!("deck layouts: {e}");
+            self.inner.open.lock().unwrap().remove(&phone);
         }
     }
 
+    /// `phone`'s layouts as that phone can draw them: with the user's themes if it draws
+    /// them, else each by its base look.
+    fn layouts_for(&self, node: &Node, phone: &Fingerprint) -> DeckLayouts {
+        let library = self.inner.saved.lock().unwrap().themes.clone();
+        self.layouts(phone).for_phone(&library, node.peer_has(phone, "deck_themes"))
+    }
+
+    /// Send the layouts now, deck showing or not; a phone that doesn't take them is fine.
+    async fn push_layouts(&self, node: &Node, phone: &Fingerprint) -> Result<(), linksy_core::Error> {
+        match node.deck_layout(phone, &self.layouts_for(node, phone)).await {
+            Err(linksy_core::Error::Unsupported) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// A phone's save (§4.26): kept, and the layouts sent back with their new version; or
+    /// refused with why (a stale one gets the current layouts too, to edit again).
+    async fn answer_save(&self, node: &Node, phone: &Fingerprint, name: &str, base_version: u64, layouts: DeckLayouts) {
+        match self.save_from_phone(phone, base_version, layouts) {
+            Ok(_) => {
+                let asked = self.news(phone);
+                if !asked.is_empty() {
+                    crate::notify::deck_asks(*phone, name.to_string(), asked);
+                }
+            }
+            Err(refused) => {
+                debug!("{name}'s deck was not saved: {}", refused.reason);
+                if let Err(e) = node.deck_layout_refused(phone, refused.code, &refused.reason, refused.version).await {
+                    debug!("deck refusal: {e}");
+                }
+                if refused.code != DeckRefusal::Stale {
+                    return;
+                }
+            }
+        }
+        if let Err(e) = self.push_layouts(node, phone).await {
+            debug!("deck layouts: {e}");
+        }
+    }
+
+    /// Whether a deck that shows now has one of the user's toggles on it, so it's worth asking.
+    fn shows_toggles(&self) -> bool {
+        let open = self.inner.open.lock().unwrap();
+        if open.is_empty() {
+            return false;
+        }
+        let saved = self.inner.saved.lock().unwrap();
+        saved.commands.iter().any(|c| c.kind == CommandKind::Toggle && open.keys().any(|p| saved.on(p, &format!("command.{}", c.id))))
+    }
+
+    /// The toggles of the user's among the actions `shown`: their action ids and checks.
+    fn toggles_among(&self, shown: &HashSet<&str>) -> Vec<(String, String)> {
+        let saved = self.inner.saved.lock().unwrap();
+        let toggles = saved.commands.iter().filter(|c| c.kind == CommandKind::Toggle).map(|c| (format!("command.{}", c.id), c.state.clone()));
+        toggles.filter(|(id, _)| shown.contains(id.as_str())).collect()
+    }
+
+    /// What each of those toggles says, a few at a time; one that can't say is left out.
+    async fn toggle_states(&self, toggles: Vec<(String, String)>) -> HashMap<String, bool> {
+        let mut found = HashMap::new();
+        for batch in toggles.chunks(CHECKS_AT_ONCE) {
+            let mut checks = tokio::task::JoinSet::new();
+            for (id, line) in batch.iter().cloned() {
+                let deck = self.clone();
+                checks.spawn(async move { (id, deck.inner.desktop.check(&line).await) });
+            }
+            while let Some(Ok((id, on))) = checks.join_next().await {
+                if let Some(on) = on {
+                    found.insert(id, on);
+                }
+            }
+        }
+        found
+    }
+
     /// The state to the decks `told` something, and to the other open ones if it changed.
-    async fn send_states(&self, node: &Node, told: &HashSet<Fingerprint>, sound_only: bool) {
+    async fn send_states(&self, node: &Node, told: &HashSet<Fingerprint>, refresh: Refresh) {
         let phones: Vec<Fingerprint> = self.inner.open.lock().unwrap().keys().copied().collect();
         let lists: Vec<(Fingerprint, Vec<DeckAction>)> = phones.into_iter().map(|p| (p, self.enabled(&p))).collect();
         let mut shown: HashSet<&str> = lists.iter().flat_map(|(_, actions)| actions.iter().map(|a| a.id.as_str())).collect();
-        if sound_only {
-            shown.retain(|id| ["sound.volume", "sound.mute"].contains(id));
+        let toggles = self.toggles_among(&shown);
+        match refresh {
+            Refresh::Sound => shown.retain(|id| ["sound.volume", "sound.mute"].contains(id)),
+            Refresh::Commands => shown.clear(),
+            Refresh::All => {}
         }
         let fresh = if shown.is_empty() { Status::default() } else { self.inner.desktop.status(&shown).await };
+        let commands = if refresh == Refresh::Sound { None } else { Some(self.toggle_states(toggles).await) };
         let status = {
             let mut last = self.inner.status.lock().unwrap();
-            if sound_only {
-                (last.level, last.muted) = (fresh.level, fresh.muted);
-            } else {
-                *last = fresh;
+            match refresh {
+                Refresh::Sound => (last.level, last.muted) = (fresh.level, fresh.muted),
+                Refresh::All => *last = fresh,
+                Refresh::Commands => {}
+            }
+            if let Some(commands) = commands {
+                last.commands = commands;
             }
             last.clone()
         };
@@ -755,6 +933,7 @@ fn states(actions: &[DeckAction], now: &Status) -> Vec<DeckState> {
                 "power.balanced" => state(Some(now.profile.as_deref()? == "balanced"), None),
                 "power.performance" => state(Some(now.profile.as_deref()? == "performance"), None),
                 "power.auto" => state(Some(now.power_auto?), None),
+                id if id.starts_with("command.") => state(Some(*now.commands.get(id)?), None),
                 _ => None,
             }
         })
@@ -771,6 +950,8 @@ mod tests {
     struct Fake {
         without: &'static [&'static str],
         ran: Mutex<Vec<Act>>,
+        /// What each toggle check line says; a line not here can't say.
+        checks: Mutex<HashMap<String, bool>>,
     }
 
     impl Fake {
@@ -814,7 +995,12 @@ mod tests {
                 airplane: has("network.airplane").then_some(false),
                 profile: ["power.saver", "power.balanced", "power.performance"].iter().any(|p| has(p)).then(|| "balanced".into()),
                 power_auto: has("power.auto").then_some(true),
+                commands: HashMap::new(),
             }
+        }
+
+        async fn check(&self, line: &str) -> Option<bool> {
+            self.checks.lock().unwrap().get(line).copied()
         }
     }
 
@@ -835,7 +1021,7 @@ mod tests {
     }
 
     fn command(id: &str, name: &str, line: &str) -> DeckCommand {
-        DeckCommand { id: id.into(), name: name.into(), command: line.into() }
+        DeckCommand { id: id.into(), name: name.into(), command: line.into(), ..Default::default() }
     }
 
     fn on(deck: &Deck<Fake>, p: &Fingerprint) -> Vec<String> {
@@ -916,7 +1102,7 @@ mod tests {
         for bad in [command("", "  ", "true"), command("", "Empty", " \n ")] {
             assert!(d.set_commands(vec![list[0].clone(), bad]).is_err());
         }
-        assert!(d.set_commands(vec![command("", &"x".repeat(MAX_NAME + 1), "true")]).is_err());
+        assert!(d.set_commands(vec![command("", &"x".repeat(deck_cmd::MAX_NAME + 1), "true")]).is_err());
         assert_eq!(d.prefs(&phone(1)).commands, list);
 
         // The second one goes, the first is kept with its id (even listed twice), and renamed
@@ -932,6 +1118,90 @@ mod tests {
         assert!(d.set_commands(vec![command("", "Many", "true"); MAX_COMMANDS + 1]).is_err());
         assert!(d.set_commands(Vec::new()).unwrap().is_empty());
         assert_eq!(d.act(&phone(1), &first, None), None);
+    }
+
+    fn toggle(name: &str, on: &str, off: &str, state: &str) -> DeckCommand {
+        DeckCommand { kind: CommandKind::Toggle, off: off.into(), state: state.into(), ..command("", name, on) }
+    }
+
+    #[test]
+    fn commands_have_their_own_group_icon_question_and_kind_on_the_phone() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = deck(&dir);
+        let list = d
+            .set_commands(vec![
+                DeckCommand { group: " Work ".into(), icon: "terminal".into(), confirm: true, ..command("", "Back Up", "rsync -a ~/a ~/b") },
+                command("", "Plain", "true"),
+                toggle("VPN", "vpn up", "vpn down", "vpn status"),
+            ])
+            .unwrap();
+        let id = |i: usize| format!("command.{}", list[i].id);
+        let by_id = |id: &str| d.prefs(&phone(1)).actions.into_iter().map(|a| a.action).find(|a| a.id == id).unwrap();
+
+        let backup = by_id(&id(0));
+        assert_eq!((backup.kind, backup.group.as_str(), backup.icon.as_deref(), backup.confirm.as_deref()), (DeckKind::Button, "Work", Some("terminal"), Some("Run Back Up?")));
+        let plain = by_id(&id(1));
+        assert_eq!((plain.group.as_str(), plain.icon, plain.confirm), (COMMANDS, None, None), "what it was before");
+        let vpn = by_id(&id(2));
+        assert_eq!((vpn.kind, vpn.group.as_str()), (DeckKind::Toggle, COMMANDS));
+
+        // Run: a button as it is, a toggle with its pieces (which one runs is decided when it does)
+        for p in [phone(1)] {
+            for i in 0..3 {
+                d.set_action(&p, &id(i), true).unwrap();
+            }
+        }
+        assert_eq!(d.act(&phone(1), &id(0), None), Some(Act::Command { name: "Back Up".into(), line: "rsync -a ~/a ~/b".into() }));
+        assert_eq!(d.act(&phone(1), &id(2), None), Some(Act::CommandToggle { name: "VPN".into(), on: "vpn up".into(), off: "vpn down".into(), state: "vpn status".into() }));
+
+        // Refused: a toggle that can't say whether it is on, a bad group or icon; nothing changes
+        for bad in [toggle("T", "a", "b", ""), DeckCommand { icon: "Bad Icon".into(), ..command("", "I", "true") }, DeckCommand { group: "a\nb".into(), ..command("", "G", "true") }] {
+            assert!(d.set_commands(vec![bad]).is_err());
+        }
+        assert_eq!(d.prefs(&phone(1)).commands, list);
+        let again = deck(&dir);
+        assert_eq!(again.prefs(&phone(1)).commands, list, "kept with all they have");
+    }
+
+    #[tokio::test]
+    async fn a_toggle_shows_what_its_check_says_and_polls_only_while_a_deck_shows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = deck(&dir);
+        let p = phone(1);
+        let list = d.set_commands(vec![toggle("VPN", "vpn up", "vpn down", "vpn on?"), toggle("Lamp", "lamp", "", "lamp on?"), toggle("Dead", "x", "", "never answers"), command("", "Button", "true")]).unwrap();
+        let id = |i: usize| format!("command.{}", list[i].id);
+        d.inner.desktop.checks.lock().unwrap().extend([("vpn on?".to_string(), true), ("lamp on?".to_string(), false)]);
+
+        assert!(!d.shows_toggles(), "no deck is open");
+        d.inner.open.lock().unwrap().insert(p, None);
+        assert!(!d.shows_toggles(), "commands are off until the user allows them");
+        d.set_action(&p, &id(0), true).unwrap();
+        assert!(d.shows_toggles());
+        d.set_action(&p, &id(0), false).unwrap();
+        d.set_action(&p, &id(3), true).unwrap();
+        assert!(!d.shows_toggles(), "a button has no state to poll");
+
+        for i in [0, 1, 2, 3] {
+            d.set_action(&p, &id(i), true).unwrap();
+        }
+        let shown: HashSet<String> = d.enabled(&p).into_iter().map(|a| a.id).collect();
+        let toggles = d.toggles_among(&shown.iter().map(String::as_str).collect());
+        assert_eq!(toggles.len(), 3, "the three toggles, not the button");
+        let found = d.toggle_states(toggles).await;
+        assert_eq!((found.get(&id(0)), found.get(&id(1)), found.get(&id(2))), (Some(&true), Some(&false), None), "one that can't say is left out");
+
+        let now = Status { commands: found, ..Default::default() };
+        let tiles = states(&d.enabled(&p), &now);
+        assert_eq!(tiles, [DeckState { id: id(0), on: Some(true), value: None, text: None }, DeckState { id: id(1), on: Some(false), value: None, text: None }]);
+
+        // Enough toggles to need more than one batch of checks
+        let many: Vec<DeckCommand> = (0..CHECKS_AT_ONCE * 2 + 1).map(|i| toggle(&format!("T{i}"), "a", "", &format!("t{i}?"))).collect();
+        let kept = d.set_commands(many).unwrap();
+        d.inner.desktop.checks.lock().unwrap().extend((0..kept.len()).map(|i| (format!("t{i}?"), i % 2 == 0)));
+        let all: Vec<(String, String)> = kept.iter().map(|c| (format!("command.{}", c.id), c.state.clone())).collect();
+        let found = d.toggle_states(all.clone()).await;
+        assert_eq!(found.len(), all.len());
+        assert!(all.iter().enumerate().all(|(i, (id, _))| found[id] == (i % 2 == 0)));
     }
 
     #[tokio::test]
@@ -1060,7 +1330,7 @@ mod tests {
         portrait.pages[0] = tiles;
         let work = DeckLayout { id: "work".into(), name: "Work".into(), theme: DeckTheme::default(), portrait, landscape: DeckFace::landscape() };
         let games = DeckLayout { id: "games".into(), name: "Games".into(), ..work.clone() };
-        DeckLayouts { version: 99, active: active.into(), layouts: vec![work, games] }
+        DeckLayouts { version: 99, active: active.into(), layouts: vec![work, games], themes: Vec::new() }
     }
 
     fn kinds(face: &DeckFace) -> Vec<(&str, Option<&str>)> {
@@ -1094,73 +1364,103 @@ mod tests {
     }
 
     #[test]
-    fn saving_counts_versions_and_allows_what_the_tiles_run() {
+    fn a_phone_saves_on_the_version_it_edited_and_never_turns_an_action_on() {
         let dir = tempfile::tempdir().unwrap();
         let d = deck(&dir);
         let p = phone(1);
-        d.set_action(&p, "media.next", false).unwrap();
-        assert_eq!(d.act(&p, "system.restart", None), None);
+        assert_eq!(d.layouts(&p).version, 0);
+        assert_eq!(d.prefs(&p).layout, None, "nothing kept yet");
         let mine = layouts("games", vec![tile("a", "button", (0, 0), (1, 1), Some("system.restart")), tile("b", "music", (0, 1), (4, 2), None)]);
-        let saved = d.set_layouts(&p, mine.clone()).unwrap();
+
+        let saved = d.save_from_phone(&p, 0, mine.clone()).unwrap();
         assert_eq!((saved.version, saved.active.as_str()), (1, "games"), "the version is counted here");
         assert_eq!(saved.layouts, mine.layouts);
-        assert_eq!(d.act(&p, "system.restart", None), Some(Act::Restart), "placing the tile allowed it");
-        assert_eq!(d.act(&p, "media.next", None), None, "the rest is as it was");
-        assert_eq!(d.act(&phone(2), "system.restart", None), None);
-        assert_eq!(d.set_layouts(&p, mine).unwrap().version, 2);
+        assert_eq!(d.layouts(&p), saved);
+        assert_eq!(d.act(&p, "system.restart", None), None, "a save doesn't allow what its tiles run");
+        assert_eq!(d.layouts(&phone(2)).version, 0, "another phone has its own");
 
+        // What it asked for: said once, until it is allowed and asked again
+        assert_eq!(d.prefs(&p).asked, ["system.restart"]);
+        assert_eq!(d.news(&p), [("system.restart".to_string(), "Restart".to_string())]);
+        assert_eq!(d.news(&p), [], "told already");
+        d.set_action(&p, "system.restart", true).unwrap();
+        assert_eq!((d.prefs(&p).asked, d.news(&p)), (Vec::new(), Vec::new()));
+        assert_eq!(d.act(&p, "system.restart", None), Some(Act::Restart), "the user's choice, on the computer");
+        d.set_action(&p, "system.restart", false).unwrap();
+        assert_eq!(d.news(&p).len(), 1, "asked for again");
+
+        // A version it didn't edit is stale; the same layouts again change nothing
+        assert_eq!(d.save_from_phone(&p, 0, mine.clone()), Err(Refused { code: DeckRefusal::Stale, reason: "the layouts on this computer changed since the ones you edited".into(), version: 1 }));
+        assert_eq!(d.save_from_phone(&p, 1, mine.clone()).unwrap().version, 1);
+        let more = layouts("work", vec![tile("a", "clock", (0, 0), (2, 1), None)]);
+        assert_eq!(d.save_from_phone(&p, 1, more).unwrap().version, 2);
+
+        let info = d.prefs(&p).layout.unwrap();
+        assert_eq!((info.version, info.name.as_str(), info.layouts), (2, "Work", 2));
+        assert!(info.saved_at.is_some_and(|at| at > 0));
         let again = deck(&dir);
-        assert_eq!(again.layouts(&p).version, 2);
-        assert_eq!(again.act(&p, "system.restart", None), Some(Act::Restart));
-        assert_eq!(again.layouts(&phone(2)).version, 0, "another phone still has the first layout");
-
-        // Only a kind that runs its action allows it
-        d.set_action(&p, "system.lock", false).unwrap();
-        d.set_layouts(&p, layouts("work", vec![tile("c", "clock", (0, 0), (2, 1), Some("system.lock"))])).unwrap();
-        assert_eq!(d.act(&p, "system.lock", None), None);
-
-        // A tool gone since: the tile it was for doesn't stop a save; a new one for it does
-        let off = layouts("work", vec![tile("d", "button", (0, 0), (1, 1), Some("system.shutdown"))]);
-        d.set_layouts(&p, off.clone()).unwrap();
-        let later = ready(dir.path().join("deck.json"), Fake { without: &["power_off", "airplane"], ..Default::default() });
-        assert!(later.set_layouts(&p, off).is_ok(), "kept from before");
-        assert!(later.set_layouts(&p, layouts("work", vec![tile("e", "button", (0, 0), (1, 1), Some("network.airplane"))])).is_err());
+        assert_eq!((again.layouts(&p).version, again.act(&p, "system.restart", None)), (2, None), "kept, and nothing turned on");
     }
 
     #[test]
-    fn layouts_that_fail_the_check_change_nothing() {
+    fn a_save_that_breaks_a_rule_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let d = deck(&dir);
         let p = phone(1);
-        let good = d.set_layouts(&p, layouts("work", vec![tile("a", "button", (0, 0), (1, 1), Some("media.next"))])).unwrap();
+        d.save_from_phone(&p, 0, layouts("work", vec![tile("a", "button", (0, 0), (1, 1), Some("media.next"))])).unwrap();
         let file = std::fs::read(dir.path().join("deck.json")).unwrap();
-        let mut big = layouts("work", vec![tile("a", "button", (0, 0), (1, 1), Some("media.next"))]);
-        big.layouts[0].portrait.pages[0][0].props.insert("note".into(), "x".repeat(MAX_BYTES));
         for bad in [
             layouts("work", vec![tile("a", "button", (0, 0), (1, 1), Some("system.screen_off"))]),
             layouts("work", vec![tile("a", "button", (0, 0), (1, 1), Some("command.nope"))]),
             layouts("work", vec![tile("a", "music", (0, 0), (4, 2), None), tile("b", "clock", (1, 1), (2, 1), None)]),
             layouts("work", vec![tile("a", "volume", (0, 0), (3, 1), Some("sound.volume"))]),
             layouts("work", vec![tile("a", "weather", (0, 0), (1, 1), None)]),
+            layouts("work", vec![DeckTile { icon: "No Good".into(), ..tile("a", "button", (0, 0), (1, 1), Some("media.next")) }]),
         ] {
-            assert!(d.set_layouts(&p, bad).is_err());
+            assert_eq!(d.save_from_phone(&p, 1, bad).unwrap_err().code, DeckRefusal::Invalid);
         }
-        let refused = d.set_layouts(&p, big).unwrap_err();
-        assert!(refused.contains("too big"), "{refused}");
-        assert_eq!(d.layouts(&p), good);
+        let mut big = layouts("work", vec![tile("a", "button", (0, 0), (1, 1), Some("media.next"))]);
+        big.layouts[0].portrait.pages[0][0].props.insert("note".into(), "x".repeat(MAX_BYTES));
+        let refused = d.save_from_phone(&p, 1, big).unwrap_err();
+        assert_eq!((refused.code, refused.version), (DeckRefusal::TooBig, 1), "{}", refused.reason);
+        assert_eq!(d.layouts(&p).version, 1);
         assert_eq!(std::fs::read(dir.path().join("deck.json")).unwrap(), file);
-        assert_eq!(d.act(&p, "system.screen_off", None), None);
     }
 
     #[test]
-    fn an_empty_or_unknown_active_layout_becomes_the_first() {
+    fn a_saved_deck_may_name_the_computers_themes_only() {
         let dir = tempfile::tempdir().unwrap();
         let d = deck(&dir);
+        let p = phone(1);
+        let mine = DeckThemeDef::from_preset("dots", "t:sun", "Sunset").unwrap();
+        d.inner.saved.lock().unwrap().themes.push(mine.clone());
+        let themed = |id: &str| {
+            let mut deck = layouts("work", vec![]);
+            deck.layouts[0].theme = DeckTheme { id: id.into(), accent: "#ff7a59".into() };
+            deck.themes = vec![DeckThemeDef { name: "From the phone".into(), ..mine.clone() }];
+            deck
+        };
+        assert_eq!(d.save_from_phone(&p, 0, themed("t:gone")).unwrap_err().code, DeckRefusal::Invalid, "a theme nobody has");
+        let saved = d.save_from_phone(&p, 0, themed("t:sun")).unwrap();
+        assert_eq!(saved.layouts[0].theme.id, "t:sun");
+        assert!(saved.themes.is_empty() && d.layouts(&p).themes.is_empty(), "the library is the computer's, not stored per phone");
+        assert_eq!(d.save_from_phone(&p, 1, themed("pixel")).unwrap().layouts[0].theme.id, "pixel");
+    }
+
+    #[test]
+    fn a_save_keeps_a_tile_whose_tool_is_gone_but_refuses_a_new_one_and_fixes_the_active_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = deck(&dir);
+        let p = phone(1);
+        let off = layouts("work", vec![tile("d", "button", (0, 0), (1, 1), Some("system.shutdown"))]);
+        d.save_from_phone(&p, 0, off.clone()).unwrap();
+        let later = ready(dir.path().join("deck.json"), Fake { without: &["power_off", "airplane"], ..Default::default() });
+        assert!(later.save_from_phone(&p, 1, layouts("work", vec![tile("d", "button", (0, 0), (1, 1), Some("system.shutdown")), tile("c", "clock", (2, 0), (2, 1), None)])).is_ok(), "kept from before");
+        assert!(later.save_from_phone(&p, 2, layouts("work", vec![tile("e", "button", (0, 0), (1, 1), Some("network.airplane"))])).is_err());
         for active in ["", "gone"] {
-            assert_eq!(d.set_layouts(&phone(1), layouts(active, vec![])).unwrap().active, "work");
+            let version = later.layouts(&p).version;
+            assert_eq!(later.save_from_phone(&p, version, layouts(active, vec![tile("z", "clock", (0, 0), (2, 1), None)])).unwrap().active, "work");
         }
-        let none = d.set_layouts(&phone(1), DeckLayouts::default()).unwrap();
-        assert_eq!((none.active.as_str(), none.layouts.len()), ("", 0));
     }
 
     #[test]
@@ -1175,8 +1475,10 @@ mod tests {
         assert_eq!(d.act(&phone(1), "system.lock", None), Some(Act::Lock));
         assert_eq!(d.act(&phone(1), "media.next", None), None);
         assert_eq!(d.prefs(&phone(1)).commands.len(), 1);
+        let old_command = d.prefs(&phone(1)).actions.into_iter().find(|a| a.action.id == "command.c1").unwrap().action;
+        assert_eq!((old_command.kind, old_command.group.as_str(), old_command.icon, old_command.confirm), (DeckKind::Button, COMMANDS, None, None), "a command from before is a plain button");
         assert_eq!(d.layouts(&phone(1)).version, 0);
-        assert_eq!(d.set_layouts(&phone(1), layouts("work", vec![])).unwrap().version, 1);
+        assert_eq!(d.save_from_phone(&phone(1), 0, layouts("work", vec![])).unwrap().version, 1);
         assert_eq!(deck(&dir).prefs(&phone(1)).commands.len(), 1, "kept beside the layouts");
     }
 }

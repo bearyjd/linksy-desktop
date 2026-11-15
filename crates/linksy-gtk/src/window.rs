@@ -13,6 +13,7 @@ mod island;
 mod transfers;
 mod invite;
 mod messages;
+mod onboarding;
 mod news;
 mod upgrade;
 mod page;
@@ -84,6 +85,8 @@ struct State {
     download_dir: Option<PathBuf>,
     port: Option<u16>,
     invite_dialog: Option<adw::Dialog>,
+    /// The first run's welcome, while it covers the window.
+    onboarding: Option<Rc<onboarding::Onboarding>>,
     /// The Add Device dialog's nearby list and its empty label, while it's open.
     invite_nearby: Option<(gtk::ListBox, gtk::Label)>,
     /// The session in which this device shares its screen, if any.
@@ -108,9 +111,9 @@ struct State {
     pictures_checked: std::collections::HashSet<Fingerprint>,
     /// The camera preview on screen: whose camera, and the pipeline reading it.
     preview: Option<(Fingerprint, gstreamer::Element)>,
-    /// Whose deck page shows, and its editor.
+    /// Whose deck page shows, and the page.
     deck: Option<Fingerprint>,
-    deck_editor: Option<Rc<deck::Editor>>,
+    deck_view: Option<Rc<deck::DeckView>>,
     /// Opening Linksy starts its service once, if it isn't running.
     started_service: bool,
     restarted_service: bool,
@@ -128,6 +131,8 @@ pub struct Window {
     bridge: Bridge,
     state: RefCell<State>,
     toasts: adw::ToastOverlay,
+    /// Over the whole window: the corner's panel, and the first run's welcome.
+    overlay: gtk::Overlay,
     stack: gtk::Stack,
     /// "Studio is watching your screen" with Stop.
     sharing_banner: adw::Banner,
@@ -338,6 +343,7 @@ impl Window {
             bridge: Bridge::new(),
             state: RefCell::default(),
             toasts,
+            overlay,
             stack,
             sharing_banner,
             split,
@@ -432,7 +438,7 @@ impl Window {
         win.camera_back.connect_clicked(move |_| {
             let Some(w) = w.upgrade() else { return };
             if w.state.borrow().deck.is_some() {
-                w.leave_deck();
+                w.back_from_deck();
             } else {
                 w.stop_preview();
                 w.render_page();
@@ -489,8 +495,9 @@ impl Window {
             }
         });
         win.refresh_setup();
-        // One thing at a time: Finish Setup when it's needed, otherwise what's new
-        if !win.offer_setup() {
+        // One thing at a time: the welcome on a first run (Finish Setup is one of its
+        // slides), else Finish Setup when it's needed, otherwise what's new
+        if !win.offer_onboarding() && !win.offer_setup() {
             win.offer_news();
         }
         let w = win.clone();
@@ -514,7 +521,8 @@ impl Window {
 
     fn setup_actions(self: &Rc<Self>) {
         type Run = fn(&Rc<Window>);
-        let actions: [(&str, Run); 15] = [
+        let actions: [(&str, Run); 16] = [
+            ("onboarding", |w| w.show_onboarding()),
             ("choose-files", |w| w.choose_files()),
             ("transfers", |w| w.open_transfers()),
             ("toggle-sidebar", |w| w.split.set_show_sidebar(!w.split.shows_sidebar())),
@@ -1134,6 +1142,7 @@ impl Window {
             Event::Paired { device } => {
                 self.close_pair_dialog(&device.id);
                 self.close_invite_dialog();
+                self.onboarding_paired(&device.name);
                 self.toast(&t!("Paired with {name}", name = device.name));
                 // Open the new device's page.
                 self.state.borrow_mut().selected = Some(device.id);
@@ -1252,7 +1261,9 @@ impl Window {
             }
             Event::Heartbeat { .. } | Event::HeartbeatWatch { .. } | Event::ClipboardWatch { .. } | Event::ClipboardFile { .. } => {}
             // The service runs decks and asks phones for their history.
-            Event::DeckOpen { .. } | Event::DeckClose { .. } | Event::DeckRun { .. } | Event::DeckActions { .. } | Event::DeckState { .. } | Event::DeckLayout { .. } => {}
+            Event::DeckOpen { .. } | Event::DeckClose { .. } | Event::DeckRun { .. } | Event::DeckActions { .. } | Event::DeckState { .. } | Event::DeckLayout { .. } | Event::DeckLayoutRefused { .. } | Event::DeckThemeDraft { .. } => {}
+            // The page shows what the phone asked for, so it asks again
+            Event::DeckLayoutSave { from, .. } => self.deck_saved_by(&from.id),
             Event::InboxHistory { .. } | Event::InboxHistoryPage { .. } => {}
             Event::GalleryChanged { from } => self.gallery_changed(&from.id),
             Event::TurnOnRequest { .. } => {}
@@ -1600,10 +1611,6 @@ impl Window {
         }
         let deck = self.state.borrow().deck;
         if deck.is_some() && deck != selected {
-            let editor = self.state.borrow().deck_editor.clone();
-            if let Some(e) = editor.filter(|e| e.dirty()) {
-                self.toast(&t!("The deck for {device} had changes that weren't saved.", device = e.device()));
-            }
             self.close_deck();
         }
         match self.selected_device() {
@@ -1719,7 +1726,36 @@ impl Window {
         });
     }
 
+    /// Send `paths` to a device. Through the relay, the slow way, something large is asked
+    /// about first: how much it is, and that it will take a while.
     fn send(self: &Rc<Self>, to: Fingerprint, paths: Vec<PathBuf>) {
+        let device = self.device(&to);
+        if device.as_ref().is_none_or(|d| d.away_relay != Some(true)) {
+            return self.send_now(to, paths);
+        }
+        let name = device.map(|d| d.device.name).unwrap_or_default();
+        let w = self.clone();
+        glib::spawn_future_local(async move {
+            let counted = paths.clone();
+            let size = gio::spawn_blocking(move || linksy_setup::size_of(&counted)).await.unwrap_or(0);
+            if size < linksy_setup::ASK_THROUGH_RELAY {
+                return w.send_now(to, paths);
+            }
+            let alert = adw::AlertDialog::builder()
+                .heading(t!("Send {size} Through the Relay?", size = crate::fmt::size(size)))
+                .body(t!("{device} is away from home and reached through the relay, which is slower than a direct connection. This can take a while.", device = name))
+                .build();
+            alert.add_responses(&[("cancel", t!("Cancel")), ("send", t!("Send"))]);
+            alert.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+            alert.set_default_response(Some("send"));
+            alert.set_close_response("cancel");
+            if alert.choose_future(Some(&w.window)).await == "send" {
+                w.send_now(to, paths);
+            }
+        });
+    }
+
+    fn send_now(self: &Rc<Self>, to: Fingerprint, paths: Vec<PathBuf>) {
         let Some(c) = self.client() else { return };
         let w = self.clone();
         let call = self.bridge.call(&c, move |c| async move { c.send(to.to_string(), paths).await });

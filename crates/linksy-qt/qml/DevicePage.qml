@@ -57,6 +57,16 @@ Kirigami.Page {
     // Its deck shows in place of the page, with Back
     property bool deckOpen: false
 
+    // The phone saved its deck: the deck page asks again, once the service has kept it
+    function deckReload() {
+        if (deckOpen) deckAgain.restart();
+    }
+    Timer {
+        id: deckAgain
+        interval: 700
+        onTriggered: if (deck.item) deck.item.load()
+    }
+
     title: deckOpen ? app.t("Deck") : name
     padding: 0
     flickable: deckOpen ? deckFlick : flick
@@ -182,7 +192,10 @@ Kirigami.Page {
     function linkText(d) {
         if (!d) return "";
         if (!d.connected) return !d.trusted ? app.t("Nearby · Not paired") : d.nearby ? app.t("Nearby") : app.t("Not nearby");
-        const what = d.away ? app.t("Away from home") : d.usb ? app.t("USB") : handheld ? app.t("Wi-Fi") : app.t("Local network");
+        // Through the relay is the slower way: said, so a slow transfer has its reason
+        const away = d.away_relay === true ? app.t("Away from home, through the relay")
+                   : d.away_relay === false ? app.t("Away from home, direct") : app.t("Away from home");
+        const what = d.away ? away : d.usb ? app.t("USB") : handheld ? app.t("Wi-Fi") : app.t("Local network");
         return typeof d.latency_ms === "number" ? app.t("{link} · {ms} ms", { link: what, ms: Math.max(1, d.latency_ms) }) : what;
     }
 
@@ -275,8 +288,17 @@ Kirigami.Page {
         ]
     }
 
+    // Ctrl+O: choose files to send, as the Send Files tile says
+    Shortcut {
+        id: openKey
+        sequence: StandardKey.Open
+        enabled: page.trusted && page.visible && !page.deckOpen
+        onActivated: filePicker.open()
+    }
+
     // Files dropped anywhere on the page go to this device
     DropArea {
+        id: drops
         anchors.fill: parent
         enabled: page.trusted
         onDropped: drop => { if (drop.hasUrls) app.sendFiles(page.info.id, drop.urls) }
@@ -311,9 +333,14 @@ Kirigami.Page {
     }
 
     QQC2.ScrollView {
+        id: scroll
         anchors.fill: parent
         visible: !page.deckOpen
         QQC2.ScrollBar.horizontal.policy: QQC2.ScrollBar.AlwaysOff
+        // The page is laid out as if the scrollbar were always there. KDE's style takes its width
+        // from the view while it shows, so a long tab and a short one would have columns of
+        // different widths, and everything would shift as the tab changes.
+        readonly property real barWidth: QQC2.ScrollBar.vertical.width
 
         Flickable {
             id: flick
@@ -327,9 +354,9 @@ Kirigami.Page {
 
             ColumnLayout {
                 id: column
-                x: (flick.width - width) / 2
+                x: (scroll.width - scroll.barWidth - width) / 2
                 y: Kirigami.Units.largeSpacing * 2
-                width: Math.min(flick.width - Kirigami.Units.gridUnit * 2, Kirigami.Units.gridUnit * 48)
+                width: Math.min(scroll.width - scroll.barWidth - Kirigami.Units.gridUnit * 2, Kirigami.Units.gridUnit * 48)
                 spacing: Kirigami.Units.largeSpacing * 2
                 visible: page.info !== null
 
@@ -497,18 +524,6 @@ Kirigami.Page {
                         }
                     }
 
-                    QQC2.Button {
-                        Layout.alignment: Qt.AlignVCenter
-                        visible: page.trusted
-                        highlighted: true
-                        icon.name: app.sym("document-send")
-                        text: app.t("Send Files")
-                        onClicked: filePicker.open()
-                        QQC2.ToolTip.visible: hovered
-                        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
-                        QQC2.ToolTip.text: app.t("Click to choose, or drop them anywhere on this page")
-                    }
-
                     // How long it can still be reached away from home
                     ColumnLayout {
                         Layout.alignment: Qt.AlignVCenter
@@ -541,21 +556,44 @@ Kirigami.Page {
                     }
                 }
 
-                // The everyday actions, one bar of tool buttons
-                Rectangle {
+                // What you do most: Send Files (also where files are dropped), then the rest
+                GridLayout {
+                    id: actionTiles
                     Layout.fillWidth: true
                     visible: page.trusted
-                    implicitHeight: actionBar.implicitHeight + Kirigami.Units.smallSpacing * 2
-                    radius: Kirigami.Units.cornerRadius * 2
-                    color: Qt.alpha(Kirigami.Theme.textColor, 0.04)
+                    columns: page.narrow ? 1 : 2
+                    columnSpacing: Kirigami.Units.largeSpacing * 1.25
+                    rowSpacing: Kirigami.Units.largeSpacing * 1.25
 
-                    RowLayout {
-                        id: actionBar
-                        anchors.fill: parent
-                        anchors.margins: Kirigami.Units.smallSpacing
-                        spacing: Kirigami.Units.smallSpacing
+                    SendTile {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.preferredWidth: 1
+                        Layout.minimumWidth: 0
+                        text: app.t("Send Files")
+                        hint: app.t("Click to choose, or drop them anywhere on this page")
+                        shortcut: openKey.nativeText
+                        dropping: drops.containsDrag
+                        onClicked: filePicker.open()
+                        QQC2.ToolTip.visible: hovered
+                        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                        QQC2.ToolTip.text: app.t("Choose files to send (Ctrl+O)")
+                    }
 
-                        BarButton {
+                    GridLayout {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.preferredWidth: 1
+                        Layout.minimumWidth: 0
+                        columns: page.narrow && page.width < Kirigami.Units.gridUnit * 28 ? 1 : 2
+                        columnSpacing: Kirigami.Units.largeSpacing * 1.25
+                        rowSpacing: Kirigami.Units.largeSpacing * 1.25
+
+                        SoftTile {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.preferredWidth: 1
+                            Layout.minimumWidth: 0
                             iconName: "edit-paste"
                             text: app.t("Clipboard")
                             hint: app.t("Send what you copied")
@@ -566,13 +604,21 @@ Kirigami.Page {
                                     app.toast(ok ? app.t("Clipboard sent to {name}", { name: page.name }) : err));
                             }
                         }
-                        BarButton {
+                        SoftTile {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.preferredWidth: 1
+                            Layout.minimumWidth: 0
                             iconName: "video-display"
                             text: app.t("View Screen")
                             hint: app.t("Watch or take control")
                             onClicked: app.viewScreen(page.info.id)
                         }
-                        BarButton {
+                        SoftTile {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.preferredWidth: 1
+                            Layout.minimumWidth: 0
                             visible: page.canRing
                             iconName: "audio-volume-high"
                             tint: Kirigami.Theme.neutralTextColor
@@ -581,25 +627,35 @@ Kirigami.Page {
                             onClicked: app.request("ring", { to: page.info.id, on: true }, (ok, err) =>
                                 app.toast(ok ? app.t("Ringing {name}…", { name: page.name }) : err))
                         }
-                        BarButton {
+                        SoftTile {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.preferredWidth: 1
+                            Layout.minimumWidth: 0
                             visible: !page.canRing
                             iconName: "preferences-desktop-notification-bell"
-                            tint: Kirigami.Theme.neutralTextColor
                             text: app.t("Ping")
                             hint: app.t("Show a notification")
                             onClicked: app.request("notify", { to: page.info.id, title: "Ping", body: "" }, (ok, err) =>
                                 app.toast(ok ? app.t("Pinged {name}", { name: page.name }) : err))
                         }
-                        BarButton {
+                        SoftTile {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.preferredWidth: 1
+                            Layout.minimumWidth: 0
                             visible: page.trusted && page.info && app.can(page.info, "snap")
                             iconName: "camera-photo"
-                            tint: Kirigami.Theme.neutralTextColor
                             text: app.t("Snap from Phone")
                             hint: app.t("Take a picture, get it here")
                             onClicked: app.request("snap", { to: page.info.id }, (ok, err) =>
                                 app.toast(ok ? app.t("Take the picture on {name}, it arrives here", { name: page.name }) : app.t("Couldn't ask {name}: {reason}", { name: page.name, reason: err.charAt(0).toUpperCase() + err.slice(1) })))
                         }
-                        BarButton {
+                        SoftTile {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            Layout.preferredWidth: 1
+                            Layout.minimumWidth: 0
                             visible: page.phone && page.info && app.can(page.info, "locate")
                             iconName: "find-location"
                             tint: Kirigami.Theme.neutralTextColor
@@ -731,7 +787,7 @@ Kirigami.Page {
                         }
                     }
                     actions: Kirigami.Action {
-                        text: app.t("Choose Actions…")
+                        text: app.t("Manage Deck…")
                         icon.name: app.sym("configure")
                         icon.color: Kirigami.Theme.linkColor
                         onTriggered: page.deckOpen = true
@@ -1273,18 +1329,144 @@ Kirigami.Page {
         }
     }
 
-    // One of the everyday actions: its icon in its colour, its name, what it does on hover
-    component BarButton: QQC2.ToolButton {
+    // Send Files, the big one: no card, just a dashed outline with sharp corners, the icon, the
+    // name and what it does. Files dropped anywhere on the page light it up (`dropping`).
+    component SendTile: QQC2.AbstractButton {
+        id: send
+        property string hint
+        property string shortcut
+        property bool dropping: false
+        implicitHeight: Kirigami.Units.gridUnit * 8.5
+        leftPadding: Kirigami.Units.gridUnit * 1.2
+        rightPadding: Kirigami.Units.gridUnit * 1.2
+        topPadding: Kirigami.Units.gridUnit * 1.1
+        bottomPadding: Kirigami.Units.gridUnit * 1.1
+        hoverEnabled: true
+
+        background: Item {
+            Rectangle {
+                anchors.fill: parent
+                color: send.dropping ? Qt.alpha(Kirigami.Theme.highlightColor, 0.14)
+                     : send.down ? Qt.alpha(Kirigami.Theme.highlightColor, 0.12)
+                     : send.hovered ? Qt.alpha(Kirigami.Theme.highlightColor, 0.06) : "transparent"
+            }
+            // Its corners are bound to the shape's own size: bound to a property of the path,
+            // Qt draws only the first dash.
+            Shape {
+                id: outline
+                anchors.fill: parent
+                ShapePath {
+                    strokeColor: send.visualFocus ? Kirigami.Theme.focusColor : Qt.alpha(Kirigami.Theme.highlightColor, send.dropping ? 1 : 0.7)
+                    strokeWidth: 1.5
+                    fillColor: "transparent"
+                    strokeStyle: ShapePath.DashLine
+                    dashPattern: [4, 3]
+                    startX: 1
+                    startY: 1
+                    PathLine { x: outline.width - 1; y: 1 }
+                    PathLine { x: outline.width - 1; y: outline.height - 1 }
+                    PathLine { x: 1; y: outline.height - 1 }
+                    PathLine { x: 1; y: 1 }
+                }
+            }
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Kirigami.Units.largeSpacing
+            RowLayout {
+                Layout.fillWidth: true
+                Rectangle {
+                    implicitWidth: Math.round(Kirigami.Units.gridUnit * 2.4)
+                    implicitHeight: implicitWidth
+                    radius: width / 2
+                    color: Qt.alpha(Kirigami.Theme.linkColor, 0.14)
+                    Kirigami.Icon {
+                        anchors.centerIn: parent
+                        width: Kirigami.Units.iconSizes.smallMedium
+                        height: width
+                        source: app.sym("document-send")
+                        fallback: "document-send"
+                        isMask: true
+                        color: Kirigami.Theme.linkColor
+                    }
+                }
+                Item { Layout.fillWidth: true }
+                QQC2.Label {
+                    Layout.alignment: Qt.AlignTop
+                    visible: send.shortcut !== ""
+                    text: send.shortcut
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                }
+            }
+            Item { Layout.fillHeight: true }
+            Kirigami.Heading {
+                Layout.fillWidth: true
+                level: 3
+                font.weight: Font.DemiBold
+                textFormat: Text.PlainText
+                text: send.text
+            }
+            QQC2.Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                textFormat: Text.PlainText
+                text: send.hint
+            }
+        }
+    }
+
+    // One of the other everyday actions, a card too: its icon in its colour, its name, what it does
+    component SoftTile: Kirigami.AbstractCard {
+        id: soft
         property string iconName
         property color tint: Kirigami.Theme.linkColor
         property string hint
-        Layout.fillWidth: true
-        display: QQC2.AbstractButton.TextBesideIcon
-        icon.name: app.sym(iconName)
-        icon.color: tint
-        QQC2.ToolTip.visible: hovered && hint !== ""
-        QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
-        QQC2.ToolTip.text: hint
+        showClickFeedback: true
+        hoverEnabled: true
+        leftPadding: Kirigami.Units.largeSpacing * 1.5
+        rightPadding: Kirigami.Units.largeSpacing * 1.5
+        contentItem: RowLayout {
+            spacing: Kirigami.Units.largeSpacing
+            Rectangle {
+                Layout.alignment: Qt.AlignVCenter
+                implicitWidth: Math.round(Kirigami.Units.gridUnit * 2.2)
+                implicitHeight: implicitWidth
+                radius: width / 2
+                color: Qt.alpha(soft.tint, 0.14)
+                Kirigami.Icon {
+                    anchors.centerIn: parent
+                    width: Kirigami.Units.iconSizes.smallMedium
+                    height: width
+                    source: app.sym(soft.iconName)
+                    fallback: soft.iconName
+                    isMask: true
+                    color: soft.tint
+                }
+            }
+            ColumnLayout {
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignVCenter
+                spacing: 2
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    font.weight: Font.DemiBold
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    text: soft.text
+                }
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    visible: soft.hint !== ""
+                    wrapMode: Text.Wrap
+                    font: Kirigami.Theme.smallFont
+                    opacity: 0.7
+                    textFormat: Text.PlainText
+                    text: soft.hint
+                }
+            }
+        }
     }
 
     // A card's actions as a section of its own, under a line across the card

@@ -137,10 +137,8 @@ pub enum Request {
     SetDeckAction { phone: String, action: String, on: bool },
     /// The user's commands, all of them (a new one without an `id`); answers them as saved.
     SetDeckCommands { commands: Vec<DeckCommand> },
-    /// A phone's deck layouts (docs/protocol.md §4.20), as the editor shows them.
-    DeckLayouts { phone: String },
-    /// Save a phone's layouts (checked; their version is set here); answers them as saved.
-    SetDeckLayouts { phone: String, layouts: linksy_core::DeckLayouts },
+    /// Try one command line on this computer, as the deck would; answers how it went.
+    TestDeckCommand { line: String },
     /// Forget the screen this computer's user picked for other devices to see or control,
     /// so the desktop's dialog shows the next time one asks. Answers whether one was kept.
     ForgetScreen,
@@ -342,6 +340,27 @@ impl Default for LockPrefs {
 pub struct DeckPrefs {
     pub actions: Vec<DeckOption>,
     pub commands: Vec<DeckCommand>,
+    /// Ids of actions that are off for this phone but that a tile it saved runs: it asked
+    /// for them (docs/protocol.md §4.26).
+    #[serde(default)]
+    pub asked: Vec<String>,
+    /// What this computer keeps of the phone's layouts; none until it has any.
+    #[serde(default)]
+    pub layout: Option<DeckLayoutInfo>,
+    /// The icon names a command may have (the phone's set), in the order to offer them.
+    #[serde(default)]
+    pub icons: Vec<String>,
+}
+
+/// The layouts a computer keeps for a phone, for the deck's page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeckLayoutInfo {
+    pub version: u64,
+    /// The layout the phone shows.
+    pub name: String,
+    pub layouts: usize,
+    /// When the phone last saved them, in milliseconds since the epoch; none: never.
+    pub saved_at: Option<u64>,
 }
 
 /// An action this computer offers, and whether it's on for the phone asked about.
@@ -358,7 +377,50 @@ pub struct DeckCommand {
     #[serde(default)]
     pub id: String,
     pub name: String,
+    /// What a button runs; what a toggle runs to turn on.
     pub command: String,
+    /// The list it shows in on the phone, as typed; none: "Commands".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// A name from the phone's icon set; none: the phone's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    /// The phone asks "Run <name>?" first.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm: bool,
+    #[serde(default)]
+    pub kind: CommandKind,
+    /// A toggle's command to turn off; none: `command` flips it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub off: String,
+    /// A toggle's check: it exits 0 while the toggle is on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// What a command of the user's is on the deck.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    /// Runs when pressed.
+    #[default]
+    Button,
+    /// Turns something on and off, and shows which (docs/protocol.md §4.26).
+    Toggle,
+}
+
+/// A command line tried once, as the user's own shell would run it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandRun {
+    /// How it ended; none if it didn't start or was stopped for taking too long.
+    pub code: Option<i32>,
+    /// The start of what it printed, both streams together.
+    pub output: String,
+    pub timed_out: bool,
 }
 
 /// Where a phone said it is.
@@ -1033,12 +1095,8 @@ impl Client {
         self.call(Request::SetDeckCommands { commands }).await
     }
 
-    pub async fn deck_layouts(&self, phone: impl Into<String>) -> Result<linksy_core::DeckLayouts, ClientError> {
-        self.call(Request::DeckLayouts { phone: phone.into() }).await
-    }
-
-    pub async fn set_deck_layouts(&self, phone: impl Into<String>, layouts: linksy_core::DeckLayouts) -> Result<linksy_core::DeckLayouts, ClientError> {
-        self.call(Request::SetDeckLayouts { phone: phone.into(), layouts }).await
+    pub async fn test_deck_command(&self, line: impl Into<String>) -> Result<CommandRun, ClientError> {
+        self.call(Request::TestDeckCommand { line: line.into() }).await
     }
 
     pub async fn forget_screen(&self) -> Result<bool, ClientError> {

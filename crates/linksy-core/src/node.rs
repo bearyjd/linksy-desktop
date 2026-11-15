@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::apps::{AppInfo, AppProbe, AppSend, DirectReady, MAX_APKS, MAX_PROBES, PreflightMsg, PreflightReply, ReceivedApp, is_apk, received_apps, valid_apps};
 use crate::deck_layout::DeckLayouts;
+use crate::deck_theme::DeckThemeDef;
 use crate::discovery::{Announce, Discovery, DiscoveryEvent, DiscoveryKey};
 use crate::error::{Error, Result, invalid, protocol};
 use crate::identity::{DeviceInfo, DeviceKind, Fingerprint, Identity};
@@ -33,7 +34,7 @@ use crate::gallery::GalleryCall;
 use crate::invite::{self, Invite};
 use crate::preflight::PreflightCall;
 use crate::settings::Settings;
-use crate::protocol::{Battery, CallState, ControlsChange, ControlsState, ConversationMessage, DeckAction, DeckState, DirectGroup, DirectStep, PluggedPhone, FsRequest, GalleryRequest, SmsMessage, SmsThread, MediaCommand, MediaState, RemoteNotification, VolumeState,
+use crate::protocol::{Battery, CallState, ControlsChange, ControlsState, ConversationMessage, DeckAction, DeckRefusal, DeckState, DirectGroup, DirectStep, PluggedPhone, FsRequest, GalleryRequest, SmsMessage, SmsThread, MediaCommand, MediaState, RemoteNotification, VolumeState,
     FileEntry, Handshake, Intent, Message, PAIRING_VERSION, PROTOCOL_VERSION, RejectReason, SessionKind, SessionMsg, TransferMsg, read_msg,
     read_value, write_msg,
 };
@@ -347,6 +348,12 @@ pub enum Event {
     DeckState { from: DeviceInfo, states: Vec<DeckState> },
     /// The layouts a computer keeps for this phone's deck (§4.20).
     DeckLayout { from: DeviceInfo, layouts: DeckLayouts },
+    /// A phone saves the layouts it edited, made on `base_version` (§4.26).
+    DeckLayoutSave { from: DeviceInfo, base_version: u64, layouts: DeckLayouts },
+    /// A computer didn't save them (§4.26).
+    DeckLayoutRefused { from: DeviceInfo, code: DeckRefusal, reason: String, version: u64 },
+    /// A computer shows a theme on the open deck, or stops (§4.26).
+    DeckThemeDraft { from: DeviceInfo, theme: Option<DeckThemeDef> },
 }
 
 /// A running media session: the stream pair, kept open (and the connection with it) until
@@ -432,6 +439,10 @@ pub struct DeviceView {
     /// Connected away from home, over the internet (docs/protocol.md §4.13).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub away: bool,
+    /// Away from home: whether its packets go through the relay (slower) or straight
+    /// between the two. None while that isn't known, and when it isn't away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub away_relay: Option<bool>,
     /// A direct link (Wi-Fi Direct, §4.17) to it is up: big transfers go over it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
@@ -602,7 +613,7 @@ struct Inner {
     dialing: Mutex<HashMap<Fingerprint, Arc<tokio::sync::Mutex<()>>>>,
     /// Offers being gathered into one prompt, per device.
     gathering: Mutex<HashMap<Fingerprint, Gathering>>,
-    /// Counts the times this device stopped taking typing (§4.26): a typing session ends
+    /// Counts the times this device stopped taking typing (§4.27): a typing session ends
     /// when it differs from the count the session started under, so a quick off-and-on
     /// can't be missed.
     typing: watch::Sender<u64>,
@@ -798,7 +809,7 @@ impl Node {
             }
             let was_typing = crate::keyboard::takes_typing(&info);
             info.features = features.clone();
-            // Typing turned off ends the typing sessions running (§4.26).
+            // Typing turned off ends the typing sessions running (§4.27).
             if was_typing && !crate::keyboard::takes_typing(&info) {
                 self.inner.typing.send_modify(|generation| *generation += 1);
             }
@@ -839,6 +850,7 @@ impl Node {
         let peers = self.inner.peers.lock().unwrap();
         let nearby = self.inner.nearby.lock().unwrap();
         let batteries = self.inner.batteries.lock().unwrap();
+        let bridges = self.inner.away.lock().unwrap().clone();
         let lanes: std::collections::HashSet<Fingerprint> = self.inner.lanes.lock().unwrap().iter().filter(|(_, l)| l.conn.close_reason().is_none()).map(|(id, _)| *id).collect();
         let mut out: Vec<DeviceView> = trust
             .list()
@@ -848,6 +860,7 @@ impl Node {
                 connected: peers.contains_key(&t.device.id),
                 usb: peers.get(&t.device.id).is_some_and(|p| link_of(p.conn.remote_address()) == Link::Usb),
                 away: peers.get(&t.device.id).is_some_and(|p| link_of(p.conn.remote_address()) == Link::Away),
+                away_relay: peers.get(&t.device.id).map(|p| p.conn.remote_address()).filter(|a| link_of(*a) == Link::Away).and_then(|a| bridges.as_ref().and_then(|b| b.relayed(a))),
                 direct: lanes.contains(&t.device.id),
                 away_all: t.away_all,
                 auto_accept: t.auto_accept,
@@ -874,7 +887,7 @@ impl Node {
             .collect();
         for (id, (device, _)) in nearby.iter() {
             if !trust.contains(id) {
-                out.push(DeviceView { device: device.clone(), trusted: false, connected: false, nearby: true, battery: None, usb: false, away: false, direct: false, away_all: false, away_until: None, auto_accept: false, allow_screen: false, latency_ms: None });
+                out.push(DeviceView { device: device.clone(), trusted: false, connected: false, nearby: true, battery: None, usb: false, away: false, away_relay: None, direct: false, away_all: false, away_until: None, auto_accept: false, allow_screen: false, latency_ms: None });
             }
         }
         // Paired and reachable first, then devices to pair, then paired ones that are away.
@@ -1166,6 +1179,29 @@ impl Node {
             return Err(Error::Unsupported);
         }
         self.send_message(to, &Message::DeckLayout { layouts: layouts.clone() }).await
+    }
+
+    /// The layouts a phone edited (§4.26), to a connected computer that announces
+    /// `deck_layout_save` ([`Error::Unsupported`] otherwise: the phone keeps them).
+    pub async fn deck_layout_save(&self, to: &Fingerprint, base_version: u64, layouts: &DeckLayouts) -> Result<()> {
+        if !self.peer_info(to).is_some_and(|p| p.features.iter().any(|f| f == "deck_layout_save")) {
+            return Err(Error::Unsupported);
+        }
+        self.send_message(to, &Message::DeckLayoutSave { base_version, layouts: layouts.clone() }).await
+    }
+
+    /// Nothing was saved (§4.26): why, and the version this computer has.
+    pub async fn deck_layout_refused(&self, to: &Fingerprint, code: DeckRefusal, reason: &str, version: u64) -> Result<()> {
+        self.send_message(to, &Message::DeckLayoutRefused { code, reason: reason.into(), version }).await
+    }
+
+    /// A theme for the phone's open deck to show without keeping it, or `None` to stop
+    /// (§4.26), to a connected phone that announces `deck_themes`.
+    pub async fn deck_theme_draft(&self, to: &Fingerprint, theme: Option<&DeckThemeDef>) -> Result<()> {
+        if !self.peer_info(to).is_some_and(|p| p.features.iter().any(|f| f == "deck_themes")) {
+            return Err(Error::Unsupported);
+        }
+        self.send_message(to, &Message::DeckThemeDraft { theme: theme.cloned() }).await
     }
 
     /// The mirrored notification `key` is gone here.
@@ -1807,6 +1843,11 @@ impl Node {
         self.inner.peers.lock().unwrap().get(id).map(|p| p.device.clone())
     }
 
+    /// Whether a connected device announced `feature`.
+    pub fn peer_has(&self, id: &Fingerprint, feature: &str) -> bool {
+        self.peer_info(id).is_some_and(|p| p.features.iter().any(|f| f == feature))
+    }
+
     /// Where a connected device's connection comes from now (over the USB cable, the
     /// bridge's local port).
     pub fn peer_address(&self, id: &Fingerprint) -> Option<SocketAddr> {
@@ -2350,6 +2391,11 @@ impl Node {
                                 Ok(Message::DeckState { states }) if states.len() <= MAX_DECK => node.emit(Event::DeckState { from, states }),
                                 Ok(Message::DeckRun { .. } | Message::DeckActions { .. } | Message::DeckState { .. }) => debug!("bad deck message from {}", from.name),
                                 Ok(Message::DeckLayout { layouts }) => node.emit(Event::DeckLayout { from, layouts }),
+                                Ok(Message::DeckLayoutSave { base_version, layouts }) => node.emit(Event::DeckLayoutSave { from, base_version, layouts }),
+                                Ok(Message::DeckLayoutRefused { code, reason, version }) if reason.len() <= MAX_KEY => node.emit(Event::DeckLayoutRefused { from, code, reason, version }),
+                                Ok(Message::DeckLayoutRefused { .. }) => debug!("bad deck_layout_refused from {}", from.name),
+                                Ok(Message::DeckThemeDraft { theme }) if theme.as_ref().is_none_or(|t| t.check().is_ok()) => node.emit(Event::DeckThemeDraft { from, theme }),
+                                Ok(Message::DeckThemeDraft { .. }) => debug!("bad deck_theme_draft from {}", from.name),
                                 Err(e) => debug!("bad message from {}: {e}", from.name),
                             }
                         });
@@ -2499,7 +2545,6 @@ impl Node {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn handle_session(self, from: DeviceInfo, mut send: quinn::SendStream, recv: quinn::RecvStream, id: Uuid, kind: SessionKind, terminal: Option<crate::protocol::TerminalOpen>, choose: bool) {
         let decline = |reason: &str, tries_left: Option<u32>| SessionMsg::SessionDecline { reason: Some(reason.into()), tries_left };
         // From away, screens, control, camera, microphone and terminals need the user's yes
@@ -2554,7 +2599,7 @@ impl Node {
             }
         }
         // Otherwise asks, unless the user allowed this device the screen for good; from away
-        // it always asks, and so does typing on a phone (§4.26).
+        // it always asks, and so does typing on a phone (§4.27).
         let typing_here = kind == SessionKind::Input && crate::keyboard::is_handheld(&self.info());
         if kind.may_always_allow()
             && !typing_here
