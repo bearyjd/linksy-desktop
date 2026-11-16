@@ -1,11 +1,14 @@
 //! A phone in the Files sidebar: a small WebDAV server on this computer, one per phone,
 //! that turns what the file manager asks into the phone's file requests (see
-//! `linksy_core::fs`). GVfs mounts it (`dav://127.0.0.1:PORT/TOKEN/`), so the phone shows
+//! `linksy_core::fs`). GVfs mounts it (`dav://linksy@127.0.0.1:PORT/`), so the phone shows
 //! up in Files and every file dialog, and (outside a Flatpak) a bookmark names it after
 //! the phone.
 //!
-//! Only this machine can connect (loopback), and only with the phone's random token in
-//! the path. Nothing is cached: every listing and read goes to the phone.
+//! Only this machine can connect (loopback), and only with a random token, sent as the
+//! HTTP Basic password. The token is minted fresh each time the bridge starts, handed to
+//! `gio mount` on its stdin, and never put in the address, so it stays out of process
+//! arguments and the bookmarks file. Nothing is cached: every listing and read goes to
+//! the phone.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use linksy_core::fs::{FsAnswer, MAX_CHUNK};
 use linksy_core::{Error, Fingerprint, FsEntry, FsRequest, Node};
 use serde::{Deserialize, Serialize};
+use base64::Engine as _;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -31,17 +35,31 @@ pub struct Bridges {
     /// Phones that have been browsed, with their address here, kept across restarts so
     /// the bookmark stays valid.
     known: Arc<Mutex<HashMap<Fingerprint, Place>>>,
-    running: Arc<Mutex<HashMap<Fingerprint, u16>>>,
+    running: Arc<Mutex<HashMap<Fingerprint, Running>>>,
+}
+
+/// A phone being served: its port, and the token the server currently accepts.
+#[derive(Clone)]
+struct Running {
+    port: u16,
+    token: Arc<Mutex<String>>,
+}
+
+/// An address plus the password that opens it.
+struct Served {
+    uri: String,
+    token: String,
+    /// The token was minted just now, so any earlier mount of this address is stale.
+    fresh: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Place {
     port: u16,
-    token: String,
 }
 
 impl Bridges {
-    /// Load the phones browsed before and serve them again.
+    /// Load the phones browsed before and serve them again (under new tokens).
     pub async fn start(path: PathBuf, node: Node) -> Self {
         let known: HashMap<Fingerprint, Place> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let bridges = Self { path, node, known: Arc::new(Mutex::new(known.clone())), running: Arc::default() };
@@ -79,25 +97,28 @@ impl Bridges {
             }
             Err(e) => return Err(e.to_string()),
         }
-        let uri = self.serve(phone).await.map_err(|e| e.to_string())?;
-        let mounted = tokio::process::Command::new("gio").args(["mount", &uri]).output().await;
-        if let Ok(out) = &mounted
-            && !out.status.success()
-            && !String::from_utf8_lossy(&out.stderr).contains("already mounted")
-        {
-            debug!("gio mount: {}", String::from_utf8_lossy(&out.stderr).trim());
+        let served = self.serve(phone).await.map_err(|e| e.to_string())?;
+        if served.fresh {
+            // A mount from an earlier run holds a token that no longer works.
+            let _ = tokio::process::Command::new("gio").args(["mount", "-u", &served.uri]).output().await;
         }
-        Ok(uri)
+        match mount(&served).await {
+            Ok(out) if !out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("already mounted") => {
+                debug!("gio mount: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
+            Err(e) => debug!("gio mount: {e}"),
+            Ok(_) => {}
+        }
+        Ok(served.uri)
     }
 
     /// Serve a phone (once), at its remembered address when possible.
-    async fn serve(&self, phone: Fingerprint) -> std::io::Result<String> {
+    async fn serve(&self, phone: Fingerprint) -> std::io::Result<Served> {
         let place = self.known.lock().unwrap().get(&phone).cloned();
-        if let Some(port) = self.running.lock().unwrap().get(&phone).copied() {
-            let token = place.map(|p| p.token).unwrap_or_default();
-            return Ok(uri(port, &token));
+        if let Some(running) = self.running.lock().unwrap().get(&phone) {
+            return Ok(Served { uri: uri(running.port), token: running.token.lock().unwrap().clone(), fresh: false });
         }
-        let token = place.as_ref().map(|p| p.token.clone()).unwrap_or_else(|| linksy_core::Uuid::new_v4().simple().to_string());
+        let token = new_token();
         let listener = match place.as_ref().map(|p| p.port) {
             Some(port) => match TcpListener::bind(("127.0.0.1", port)).await {
                 Ok(l) => l,
@@ -106,22 +127,23 @@ impl Bridges {
             None => TcpListener::bind(("127.0.0.1", 0)).await?,
         };
         let port = listener.local_addr()?.port();
-        self.known.lock().unwrap().insert(phone, Place { port, token: token.clone() });
+        self.known.lock().unwrap().insert(phone, Place { port });
         self.save();
-        self.running.lock().unwrap().insert(phone, port);
+        let shared = Arc::new(Mutex::new(token.clone()));
+        self.running.lock().unwrap().insert(phone, Running { port, token: shared.clone() });
         info!("serving a phone's files on 127.0.0.1:{port}");
-        let (node, prefix) = (self.node.clone(), format!("/{token}"));
+        let node = self.node.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (node, prefix) = (node.clone(), prefix.clone());
+                let (node, token) = (node.clone(), shared.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = connection(stream, node, phone, prefix).await {
+                    if let Err(e) = connection(stream, node, phone, token).await {
                         debug!("file manager connection: {e}");
                     }
                 });
             }
         });
-        Ok(uri(port, &token))
+        Ok(Served { uri: uri(port), token, fresh: true })
     }
 
     fn save(&self) {
@@ -132,8 +154,39 @@ impl Bridges {
     }
 }
 
-fn uri(port: u16, token: &str) -> String {
-    format!("dav://127.0.0.1:{port}/{token}/")
+/// Where a phone's files are mounted. The token is the password, not part of this.
+fn uri(port: u16) -> String {
+    format!("dav://linksy@127.0.0.1:{port}/")
+}
+
+fn new_token() -> String {
+    format!("{}{}", linksy_core::Uuid::new_v4().simple(), linksy_core::Uuid::new_v4().simple())
+}
+
+/// `gio mount`, with the token on its stdin (it asks for the password there), so it never
+/// shows up in the process list.
+async fn mount(served: &Served) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new("gio")
+        .args(["mount", &served.uri])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // gio may not ask (already mounted); a closed pipe is fine then.
+        let _ = stdin.write_all(format!("{}\n", served.token).as_bytes()).await;
+    }
+    child.wait_with_output().await
+}
+
+/// Does this Authorization header carry the token as its Basic password?
+fn authorized(header: Option<&str>, token: &str) -> bool {
+    let Some(encoded) = header.and_then(|h| h.strip_prefix("Basic ")) else { return false };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else { return false };
+    let Some(password) = decoded.iter().position(|&b| b == b':').map(|i| &decoded[i + 1..]) else { return false };
+    // Compare without stopping at the first difference.
+    password.len() == token.len() && password.iter().zip(token.as_bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 /// Add the phone to the Files sidebar under its own name (GTK's bookmarks file, the
@@ -175,11 +228,19 @@ struct Request {
 }
 
 /// One file-manager connection: requests one after another until it closes.
-async fn connection(stream: TcpStream, node: Node, phone: Fingerprint, prefix: String) -> std::io::Result<()> {
+async fn connection(stream: TcpStream, node: Node, phone: Fingerprint, token: Arc<Mutex<String>>) -> std::io::Result<()> {
+    // The address carries no token, so paths start at the phone's root.
+    let prefix = String::new();
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     loop {
         let Some(req) = head(&mut read).await? else { return Ok(()) };
+        let current = token.lock().unwrap().clone();
+        if !authorized(req.headers.get("authorization").map(String::as_str), &current) {
+            skip_body(&mut read, &req).await?;
+            respond(&mut write, 401, "Unauthorized", &[("WWW-Authenticate", "Basic realm=\"Linksy\", charset=\"UTF-8\"")], b"").await?;
+            continue;
+        }
         let close = req.headers.get("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
         let path = match req.path.split('?').next().map(percent_decode).and_then(|p| p.strip_prefix(&prefix).map(str::to_string)) {
             Some(p) if p.is_empty() || p.starts_with('/') => clean(&p),
@@ -603,8 +664,29 @@ mod tests {
         assert_eq!(parse_range("bytes=2000-", 1000), None);
         assert_eq!(clean("/a/./b//../c/"), "/a/c");
         assert_eq!(clean("/../../etc"), "/etc");
-        assert_eq!(destination("http://127.0.0.1:5/tok/DCIM/b%20c.jpg", "/tok").as_deref(), Some("/DCIM/b c.jpg"));
+        assert_eq!(destination("http://127.0.0.1:5/DCIM/b%20c.jpg", "").as_deref(), Some("/DCIM/b c.jpg"));
         assert_eq!(percent_encode("/My Photos/é.jpg"), "/My%20Photos/%C3%A9.jpg");
         assert_eq!(http_date(1_792_492_200), "Tue, 20 Oct 2026 10:30:00 GMT");
+    }
+
+    #[test]
+    fn the_token_is_a_password_never_part_of_the_address() {
+        let token = new_token();
+        assert_ne!(token, new_token(), "each mount gets its own token");
+        let address = uri(4242);
+        assert_eq!(address, "dav://linksy@127.0.0.1:4242/");
+        assert!(!address.contains(&token));
+    }
+
+    #[test]
+    fn only_the_current_token_passes_basic_auth() {
+        let header = |user: &str, pw: &str| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pw}")));
+        assert!(authorized(Some(&header("linksy", "s3cret")), "s3cret"));
+        assert!(authorized(Some(&header("anyone", "s3cret")), "s3cret"));
+        assert!(!authorized(Some(&header("linksy", "old")), "s3cret"));
+        assert!(!authorized(Some(&header("linksy", "")), "s3cret"));
+        assert!(!authorized(Some("Basic !!!"), "s3cret"));
+        assert!(!authorized(Some("Bearer s3cret"), "s3cret"));
+        assert!(!authorized(None, "s3cret"));
     }
 }
